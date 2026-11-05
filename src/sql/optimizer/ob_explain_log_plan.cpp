@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_OPT
 #include "sql/optimizer/ob_explain_log_plan.h"
 #include "sql/optimizer/ob_log_values.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/code_generator/ob_code_generator.h"
 
 using namespace oceanbase;
@@ -24,6 +25,68 @@ using namespace sql;
 using namespace oceanbase::common;
 using namespace oceanbase::json;
 using namespace oceanbase::sql::log_op_def;
+namespace
+{
+
+const char *describe_type_name(ObObjType type)
+{
+  const char *name = "VARCHAR";
+  switch (type) {
+    case ObNullType: name = "NULL"; break;
+    case ObTinyIntType: name = "BOOLEAN"; break;
+    case ObIntType:
+    case ObUInt64Type: name = "BIGINT"; break;
+    case ObFloatType:
+    case ObDoubleType:
+    case ObNumberType:
+    case ObUNumberType:
+    case ObDecimalIntType: name = "DOUBLE"; break;
+    case ObDateType:
+    case ObMySQLDateType: name = "DATE"; break;
+    case ObDateTimeType:
+    case ObTimestampType:
+    case ObMySQLDateTimeType:
+    case ObTimestampLTZType:
+    case ObTimestampNanoType: name = "DATETIME"; break;
+    default: name = "VARCHAR"; break;
+  }
+  return name;
+}
+
+const ObFileColumnDef *get_file_column_def(const ObSelectStmt &stmt,
+                                           const ObRawExpr *expr)
+{
+  const ObFileColumnDef *column_def = NULL;
+  if (NULL != expr && expr->is_column_ref_expr()) {
+    const ObColumnRefRawExpr *column_expr =
+        static_cast<const ObColumnRefRawExpr *>(expr);
+    const TableItem *table_item = stmt.get_table_item_by_id(column_expr->get_table_id());
+    const uint64_t column_id = column_expr->get_column_id();
+    if (NULL != table_item && table_item->is_file_table()
+        && NULL != table_item->file_table_def_
+        && column_id >= OB_APP_MIN_COLUMN_ID) {
+      const int64_t index = static_cast<int64_t>(column_id - OB_APP_MIN_COLUMN_ID);
+      if (index >= 0 && index < table_item->file_table_def_->columns_.count()) {
+        column_def = &table_item->file_table_def_->columns_.at(index);
+      }
+    }
+  }
+  return column_def;
+}
+
+void set_varchar_obj(ObObj &obj, const ObString &value)
+{
+  obj.set_varchar(value);
+  obj.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+}
+
+void set_varchar_obj(ObObj &obj, const char *value)
+{
+  set_varchar_obj(obj, ObString::make_string(value));
+}
+
+} // namespace
+
 
 /**
  *  This function does two things:
@@ -44,8 +107,11 @@ int ObExplainLogPlan::generate_normal_raw_plan()
     ObLogValues *values_op = NULL;
     int64_t batch_size = 0;
     const ObExplainStmt *explain_stmt = static_cast<const ObExplainStmt*>(get_stmt());
+    bool describe_query = false;
     if (OB_ISNULL(child_stmt = explain_stmt->get_explain_query_stmt())) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (FALSE_IT(describe_query = explain_stmt->is_describe_query()
+                                         && child_stmt->is_select_stmt())) {
     } else if (OB_ISNULL(child_plan = optimizer_context_.get_log_plan_factory().
                          create(optimizer_context_, *child_stmt))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -63,7 +129,35 @@ int ObExplainLogPlan::generate_normal_raw_plan()
       child_plan->get_optimizer_context().set_batch_size(batch_size);
       values_op = static_cast<ObLogValues*>(top);
       values_op->set_explain_plan(child_plan);
-      ObSqlPlan sql_plan(get_allocator());
+      if (describe_query) {
+        const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(child_stmt);
+        for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+          const SelectItem &item = select_stmt->get_select_item(i);
+          const ObRawExpr *expr = item.expr_;
+          const ObFileColumnDef *file_column = get_file_column_def(*select_stmt, expr);
+          const ObString &column_name = item.alias_name_.empty()
+              ? item.expr_name_ : item.alias_name_;
+          const ObObjType type = NULL != file_column
+              ? file_column->obj_type_
+              : (NULL == expr ? ObVarcharType : expr->get_result_type().get_type());
+          const bool nullable = NULL != file_column
+              ? file_column->nullable_
+              : (NULL == expr || !expr->get_result_type().has_result_flag(NOT_NULL_FLAG));
+          ObObj cells[6];
+          set_varchar_obj(cells[0], column_name);
+          set_varchar_obj(cells[1], describe_type_name(type));
+          set_varchar_obj(cells[2], nullable ? "YES" : "NO");
+          cells[3].set_null();
+          cells[4].set_null();
+          cells[5].set_null();
+          ObNewRow row;
+          row.cells_ = cells;
+          row.count_ = 6;
+          if (OB_FAIL(values_op->add_row(row))) {
+          }
+        }
+      } else {
+        ObSqlPlan sql_plan(get_allocator());
       sql_plan.set_session_info(get_optimizer_context().get_session_info());
       ObExplainLogPlan *explain_plan = static_cast<ObExplainLogPlan*>(child_plan);
       ObSEArray<common::ObString, 64> plan_strs;
@@ -91,6 +185,7 @@ int ObExplainLogPlan::generate_normal_raw_plan()
         if (OB_FAIL(values_op->add_row(row))) {
         }
       }
+      }
       if (OB_SUCC(ret)) {
         // set values_op operator id && set max operator id for LogPlan
         values_op->set_op_id(0);
@@ -99,7 +194,8 @@ int ObExplainLogPlan::generate_normal_raw_plan()
     }
     get_optimizer_context().get_all_exprs().reuse();
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(allocate_output_expr_for_values_op(*values_op))) {
+    } else if (OB_FAIL(allocate_output_expr_for_values_op(*values_op,
+                                                          describe_query ? 6 : 1))) {
     } else {
       get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             ObPhyPlanType::OB_PHY_PLAN_LOCAL,

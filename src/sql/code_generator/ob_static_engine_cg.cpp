@@ -5547,19 +5547,47 @@ int ObStaticEngineCG::generate_spec(ObLogFileTable &op, ObFileTableSpec &spec,
              || OB_ISNULL(def = table_item->file_table_def_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to get file table definition", K(ret));
-  } else if (OB_FAIL(spec.column_exprs_.init(op.get_access_exprs().count()))) {
+  } else if (OB_FAIL(spec.column_exprs_.init(op.get_access_exprs().count()))
+             || OB_FAIL(spec.column_idxs_.init(op.get_access_exprs().count()))) {
   } else if (OB_FAIL(ob_write_string(phy_plan_->get_allocator(), def->file_path_,
                                      spec.file_path_))) {
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_access_exprs().count(); ++i) {
+      ObRawExpr *raw_expr = op.get_access_exprs().at(i);
       ObExpr *rt_expr = NULL;
-      if (OB_FAIL(mark_expr_self_produced(op.get_access_exprs().at(i)))) {
-      } else if (OB_FAIL(generate_rt_expr(*op.get_access_exprs().at(i), rt_expr))) {
+      if (OB_ISNULL(raw_expr) || !raw_expr->is_column_ref_expr()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid file table access expression", K(ret), K(raw_expr));
+      } else if (OB_FAIL(mark_expr_self_produced(raw_expr))) {
+      } else if (OB_FAIL(generate_rt_expr(*raw_expr, rt_expr))) {
       } else if (OB_FAIL(spec.column_exprs_.push_back(rt_expr))) {
+      } else {
+        const ObColumnRefRawExpr *column_expr =
+            static_cast<const ObColumnRefRawExpr *>(raw_expr);
+        if (column_expr->get_column_id() < OB_APP_MIN_COLUMN_ID) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid file table column id", K(ret), K(column_expr->get_column_id()));
+        } else if (OB_FAIL(spec.column_idxs_.push_back(
+                       column_expr->get_column_id() - OB_APP_MIN_COLUMN_ID))) {
+        }
       }
     }
     if (OB_SUCC(ret)) {
-      spec.format_ = def->func_type_;
+      switch (def->func_type_) {
+        case ObFileTableDef::READ_JSON:
+        case ObFileTableDef::READ_NDJSON:
+          spec.format_ = file_sql::FILE_FORMAT_JSONL;
+          break;
+        case ObFileTableDef::READ_PARQUET:
+          spec.format_ = file_sql::FILE_FORMAT_PARQUET;
+          break;
+        case ObFileTableDef::GLOB_FUNC:
+          spec.format_ = file_sql::FILE_FORMAT_GLOB;
+          break;
+        default:
+          spec.format_ = file_sql::FILE_FORMAT_CSV;
+          break;
+      }
       spec.header_ = def->header_;
     }
   }

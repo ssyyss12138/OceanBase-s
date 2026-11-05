@@ -25,6 +25,7 @@ namespace sql
 {
 ObExplainStmt::ObExplainStmt() : ObDMLStmt(stmt::T_EXPLAIN),
                                  format_(EXPLAIN_UNINITIALIZED),
+                                 describe_query_(false),
                                  explain_query_stmt_(NULL)
 {
 }

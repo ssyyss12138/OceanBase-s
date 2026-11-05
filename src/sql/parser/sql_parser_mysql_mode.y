@@ -57,6 +57,7 @@
 %destructor {destroy_tree($$);}<node>
 %destructor {oceanbase::common::ob_free($$);}<str_value_>
 
+%expect 3
 %token <node> NAME_OB
 %token <node> STRING_VALUE
 %token <node> NATIONAL_LITERAL
@@ -497,6 +498,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%type <node> file_table_expr file_table_args file_table_named_arg_list file_table_named_arg
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -10844,6 +10846,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | hybrid_search_expr
 {
   $$ = $1;
@@ -17448,6 +17454,51 @@ UNNEST '(' simple_expr_list ')'
 | UNNEST '(' simple_expr_list ')' AS relation_name '(' relation_name_list ')'
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_UNNEST_EXPRESSION, 3, $3, $6, $8);
+}
+;
+
+/* file as database: read_csv(...), read_json(...), read_parquet(...), glob(...) */
+file_table_expr:
+  relation_name '(' file_table_args ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, NULL);
+}
+| relation_name '(' file_table_args ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| relation_name '(' file_table_args ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
+}
+;
+
+file_table_args:
+  expr %prec LOWER_COMMA
+{
+  $$ = $1;
+}
+| expr ',' file_table_named_arg_list
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+file_table_named_arg_list:
+  file_table_named_arg
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| file_table_named_arg_list ',' file_table_named_arg
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+file_table_named_arg:
+  relation_name COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $3);
 }
 ;
 

@@ -32,15 +32,18 @@ namespace sql
 // columns. Rows are produced in batches, the whole file is never materialized.
 class ObFileTableSpec : public ObOpSpec
 {
+  OB_UNIS_VERSION_V(1);
 public:
   ObFileTableSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
     : ObOpSpec(alloc, type),
       column_exprs_(alloc),
+      column_idxs_(alloc),
       file_path_(),
       format_(0),
       header_(true) {}
-  // one expression per inferred column, filled by the code generator
+  // One expression and source-file column index per accessed column.
   common::ObFixedArray<ObExpr *, common::ObIAllocator> column_exprs_;
+  common::ObFixedArray<int64_t, common::ObIAllocator> column_idxs_;
   common::ObString file_path_;
   int64_t format_;
   bool header_;

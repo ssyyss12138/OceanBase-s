@@ -8492,8 +8492,15 @@ int ObJoinOrder::generate_file_table_paths()
     file_path->parent_ = this;
     output_rows_ = 1000;
     output_row_size_ = 100;
-    if (OB_FAIL(file_path->estimate_cost())) {
+    file_path->strong_sharding_ = get_plan()->get_optimizer_context().get_match_all_sharding();
+    if (OB_FAIL(file_path->set_parallel_info_for_match_all())) {
+    } else if (OB_FAIL(ObOptimizerUtil::classify_subquery_exprs(get_restrict_infos(),
+                                                                file_path->subquery_exprs_,
+                                                                file_path->filter_,
+                                                                false /* with_onetime */))) {
+    } else if (OB_FAIL(file_path->estimate_cost())) {
     } else if (OB_FAIL(file_path->compute_pipeline_info())) {
+    } else if (OB_FAIL(create_plan_for_path_with_subq(file_path))) {
     } else if (OB_FAIL(add_path(file_path))) {
     }
   }

@@ -49,6 +49,8 @@ public:
   const ObExplainDisplayOpt &get_display_opt() const { return display_opt_; }
   ObDMLStmt* get_explain_query_stmt() const { return explain_query_stmt_; }
   void set_explain_query_stmt(ObDMLStmt *stmt) { explain_query_stmt_ = stmt; }
+  void set_describe_query(bool value) { describe_query_ = value; }
+  bool is_describe_query() const { return describe_query_; }
   bool is_select_explain() const;
   const common::ObString& get_into_table() const { return into_table_; }
   void set_into_table(const common::ObString& into_table) { into_table_ = into_table; }
@@ -63,6 +65,7 @@ private:
   //bool  verbose_;
   ExplainType format_;
   ObExplainDisplayOpt display_opt_;
+  bool describe_query_;
   ObDMLStmt *explain_query_stmt_;
   common::ObString into_table_;
   common::ObString statement_id_;

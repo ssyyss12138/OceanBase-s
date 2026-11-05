@@ -2301,7 +2301,12 @@ int ObLogPlan::allocate_file_table_path(FileTablePath *file_table_path,
   } else {
     op->set_table_id(file_table_path->table_id_);
     op->set_table_name(table_item->get_table_name());
-    out_access_path_op = op;
+    if (OB_FAIL(append(op->get_filter_exprs(), file_table_path->filter_))) {
+    } else if (OB_FAIL(op->compute_property(file_table_path))) {
+    } else if (OB_FAIL(op->pick_out_startup_filters())) {
+    } else {
+      out_access_path_op = op;
+    }
   }
   return ret;
 }
@@ -10360,12 +10365,14 @@ int ObLogPlan::get_cached_hash_sharding_info(const ObIArray<ObRawExpr*> &hash_ex
   return ret;
 }
 
-int ObLogPlan::allocate_output_expr_for_values_op(ObLogicalOperator &values_op)
+int ObLogPlan::allocate_output_expr_for_values_op(ObLogicalOperator &values_op,
+                                                   int64_t column_count)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(optimizer_context_.get_session_info())) {
-    ret = OB_ERR_UNEXPECTED;
-  } else {
+  if (OB_ISNULL(optimizer_context_.get_session_info()) || column_count <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
     // Static typing engine need expr to output rows. We generate a const output expr
     // for values_op operator.
     ObConstRawExpr *output = NULL;
@@ -10377,14 +10384,14 @@ int ObLogPlan::allocate_output_expr_for_values_op(ObLogicalOperator &values_op)
       output->set_value(v);
       if (OB_FAIL(output->formalize(optimizer_context_.get_session_info()))) {
       } else if (OB_FAIL(values_op.get_output_exprs().push_back(output))) {
-      } else {
-        values_op.set_branch_id(0);
-        values_op.set_id(0);
-        values_op.set_op_id(0);
-        if (OB_FAIL(get_optimizer_context().get_all_exprs().append(output))) {
-        } else { /*do nothing*/ }
+      } else if (OB_FAIL(get_optimizer_context().get_all_exprs().append(output))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    values_op.set_branch_id(0);
+    values_op.set_id(0);
+    values_op.set_op_id(0);
   }
   return ret;
 }

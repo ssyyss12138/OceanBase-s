@@ -31,6 +31,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 namespace oceanbase
 {
@@ -52,8 +53,7 @@ ObObjType file_logical_type_to_obj_type(file_sql::FileLogicalType type)
     case file_sql::FILE_TYPE_DATE: obj_type = ObDateType; break;
     case file_sql::FILE_TYPE_DATETIME: obj_type = ObDateTimeType; break;
     case file_sql::FILE_TYPE_VARCHAR: obj_type = ObVarcharType; break;
-    case file_sql::FILE_TYPE_NULL:
-    default: obj_type = ObVarcharType; break;
+    case file_sql::FILE_TYPE_NULL: obj_type = ObNullType; break;
   }
   return obj_type;
 }
@@ -62,9 +62,18 @@ ObObjType file_logical_type_to_obj_type(file_sql::FileLogicalType type)
 bool get_string_literal(const ParseNode *node, ObString &value)
 {
   bool found = false;
-  if (NULL != node && (T_VARCHAR == node->type_ || T_CHAR == node->type_)
-      && NULL != node->str_value_) {
-    value.assign_ptr(node->str_value_, static_cast<int32_t>(node->str_len_));
+  if (NULL != node && (T_VARCHAR == node->type_ || T_CHAR == node->type_
+                       || T_QUESTIONMARK == node->type_)
+      && NULL != node->str_value_ && node->str_len_ > 0) {
+    int32_t begin = 0;
+    int32_t end = static_cast<int32_t>(node->str_len_);
+    const char first = node->str_value_[0];
+    if ((0x27 == first || 0x22 == first) && end > 1
+        && node->str_value_[end - 1] == first) {
+      begin = 1;
+      --end;
+    }
+    value.assign_ptr(node->str_value_ + begin, end - begin);
     found = true;
   }
   return found;
@@ -74,12 +83,31 @@ bool get_bool_literal(const ParseNode *node, bool &value)
 {
   bool found = false;
   if (NULL != node) {
-    if (T_BOOL == node->type_) {
+    if (node->is_literal_bool_) {
+      value = (1 == node->value_);
+      found = true;
+    } else if (T_BOOL == node->type_) {
       value = (1 == node->value_);
       found = true;
     } else if (T_NUMBER == node->type_) {
       value = (0 != node->value_);
       found = true;
+    } else if (T_QUESTIONMARK == node->type_ && NULL != node->str_value_
+               && node->str_len_ > 0) {
+      const int32_t len = static_cast<int32_t>(node->str_len_);
+      if ((4 == len && 0 == strncasecmp(node->str_value_, "true", 4))
+          || (3 == len && 0 == strncasecmp(node->str_value_, "yes", 3))
+          || (2 == len && 0 == strncasecmp(node->str_value_, "on", 2))
+          || (1 == len && '1' == node->str_value_[0])) {
+        value = true;
+        found = true;
+      } else if ((5 == len && 0 == strncasecmp(node->str_value_, "false", 5))
+                 || (2 == len && 0 == strncasecmp(node->str_value_, "no", 2))
+                 || (3 == len && 0 == strncasecmp(node->str_value_, "off", 3))
+                 || (1 == len && '0' == node->str_value_[0])) {
+        value = false;
+        found = true;
+      }
     }
   }
   return found;
@@ -153,6 +181,28 @@ int dedup_file_column_names(ObIArray<ObFileColumnDef> &columns, ObIAllocator &al
 }
 
 
+// Flattens the left-deep T_LINK_NODE argument list built by the parser.
+int flatten_file_table_args(const ParseNode *node, ObIArray<const ParseNode *> &out)
+{
+  int ret = OB_SUCCESS;
+  if (NULL == node) {
+    ret = OB_ERR_PARSER_SYNTAX;
+  } else if (T_EXPR_LIST == node->type_) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+      if (OB_FAIL(out.push_back(node->children_[i]))) {
+      }
+    }
+  } else if (T_LINK_NODE == node->type_) {
+    if (OB_UNLIKELY(2 != node->num_child_)) {
+      ret = OB_ERR_PARSER_SYNTAX;
+    } else if (OB_FAIL(flatten_file_table_args(node->children_[0], out))) {
+    } else if (OB_FAIL(flatten_file_table_args(node->children_[1], out))) {
+    }
+  } else if (OB_FAIL(out.push_back(node))) {
+  }
+  return ret;
+}
+
 // Canonicalizes both paths and verifies that the file lives inside
 // secure_file_priv. Returns OB_ERR_NO_PRIVILEGE when it escapes.
 int check_file_path_in_priv(const ObString &priv, const ObString &path)
@@ -164,7 +214,7 @@ int check_file_path_in_priv(const ObString &priv, const ObString &path)
   std::string path_str(path.ptr(), path.length());
   std::string priv_str(priv.ptr(), priv.length());
   if (NULL == ::realpath(path_str.c_str(), buf)) {
-    ret = OB_ERR_NO_PRIVILEGE;
+    ret = OB_FILE_NOT_EXIST;
   } else {
     canon_path.assign(buf);
     MEMSET(buf, 0, sizeof(buf));
@@ -187,6 +237,22 @@ int check_file_path_in_priv(const ObString &priv, const ObString &path)
     }
   }
   return ret;
+}
+
+int check_glob_pattern_in_priv(const ObString &priv, const ObString &pattern)
+{
+  std::string pattern_str(pattern.ptr(), pattern.length());
+  const size_t slash = pattern_str.find_last_of('/');
+  std::string directory;
+  if (std::string::npos == slash) {
+    directory = ".";
+  } else if (0 == slash) {
+    directory = "/";
+  } else {
+    directory = pattern_str.substr(0, slash);
+  }
+  const ObString directory_path(static_cast<int32_t>(directory.size()), directory.data());
+  return check_file_path_in_priv(priv, directory_path);
 }
 
 }  // namespace
@@ -216,6 +282,15 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
     if (NULL == alias_node && parse_tree.num_child_ >= 3) {
       alias_node = parse_tree.children_[2];
     }
+  }
+
+  bool enable_file_sql = false;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(session_info_->get_sys_variable(
+                         share::SYS_VAR_ENABLE_FILE_SQL, enable_file_sql))) {
+    LOG_WARN("failed to read enable_file_sql", K(ret));
+  } else if (!enable_file_sql) {
+    ret = OB_NOT_SUPPORTED;
   }
 
   // Parse the function name into a format / function type.
@@ -249,27 +324,32 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
   // The first argument must be a string literal file path, the remaining
   // arguments must be named (DuckDB style `name = value`).
   if (OB_SUCC(ret)) {
-    if (OB_ISNULL(args) || OB_UNLIKELY(T_EXPR_LIST != args->type_) || 0 == args->num_child_) {
+    ObSEArray<const ParseNode *, 8> arg_nodes;
+    if (OB_FAIL(flatten_file_table_args(args, arg_nodes))) {
+    } else if (OB_UNLIKELY(arg_nodes.count() < 1)) {
       ret = OB_ERR_PARSER_SYNTAX;
-      LOG_WARN("file table function requires a path argument", K(ret));
-    } else if (OB_FAIL(get_string_literal(args->children_[0], table_def->file_path_))) {
+    } else if (!get_string_literal(arg_nodes.at(0), table_def->file_path_)) {
       ret = OB_ERR_PARSER_SYNTAX;
-      LOG_WARN("the first argument of the file table function must be a string literal", K(ret));
     }
-    for (int64_t i = 1; OB_SUCC(ret) && i < args->num_child_; ++i) {
+    for (int64_t i = 1; OB_SUCC(ret) && i < arg_nodes.count(); ++i) {
       ObString arg_name;
       const ParseNode *value_node = NULL;
-      if (OB_FAIL(get_named_arg(args->children_[i], arg_name, value_node))) {
+      if (!get_named_arg(arg_nodes.at(i), arg_name, value_node)) {
         ret = OB_ERR_PARSER_SYNTAX;
         LOG_WARN("expected a named argument like name = value", K(ret), K(i));
       } else if (0 == arg_name.case_compare("header")) {
-        if (OB_FAIL(get_bool_literal(value_node, table_def->header_))) {
+        if (!get_bool_literal(value_node, table_def->header_)) {
           ret = OB_ERR_PARSER_SYNTAX;
         }
       } else if (0 == arg_name.case_compare("sample_size")) {
         // Only a full file scan is supported by design.
         bool is_all = false;
         if (NULL != value_node && T_NUMBER == value_node->type_ && -1 == value_node->value_) {
+          is_all = true;
+        } else if (NULL != value_node && T_QUESTIONMARK == value_node->type_
+                   && NULL != value_node->str_value_ && value_node->str_len_ > 0
+                   && '-' == value_node->str_value_[0]
+                   && 2 == value_node->str_len_ && '1' == value_node->str_value_[1]) {
           is_all = true;
         } else if (NULL != value_node && T_OP_NEG == value_node->type_
                    && 1 == value_node->num_child_ && NULL != value_node->children_[0]
@@ -282,7 +362,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
           LOG_WARN("only sample_size = -1 is supported", K(ret));
         }
       } else if (0 == arg_name.case_compare("format")) {
-        if (OB_FAIL(get_string_literal(value_node, table_def->format_))) {
+        if (!get_string_literal(value_node, table_def->format_)) {
           ret = OB_ERR_PARSER_SYNTAX;
         } else if (0 == table_def->format_.case_compare("csv")) {
           // ok
@@ -296,7 +376,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
         }
       } else if (0 == arg_name.case_compare("delimiter")) {
         ObString value;
-        if (OB_FAIL(get_string_literal(value_node, value)) || 1 != value.length()) {
+        if (!get_string_literal(value_node, value) || 1 != value.length()) {
           ret = OB_ERR_PARSER_SYNTAX;
         }
       } else {
@@ -306,8 +386,23 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
     }
   }
 
-  // Secure path check: the resolved file must be inside secure_file_priv.
-  if (OB_SUCC(ret) && ObFileTableDef::GLOB_FUNC != table_def->func_type_) {
+  // The literal may still carry its surrounding quotes (parameter marker
+  // nodes keep the original text), strip them here.
+  if (OB_SUCC(ret)) {
+    ObString &p = table_def->file_path_;
+    if (p.length() >= 2 && (0x27 == p[0] || 0x22 == p[0])
+        && p[p.length() - 1] == p[0]) {
+      p.assign_ptr(p.ptr() + 1, p.length() - 2);
+    }
+    ObString &f = table_def->format_;
+    if (f.length() >= 2 && (0x27 == f[0] || 0x22 == f[0])
+        && f[f.length() - 1] == f[0]) {
+      f.assign_ptr(f.ptr() + 1, f.length() - 2);
+    }
+  }
+
+  // Secure path check: files and glob directories must stay inside secure_file_priv.
+  if (OB_SUCC(ret)) {
     ObString secure_path;
     ObObj global_val;
     if (OB_FAIL(session_info_->get_secure_file_priv(secure_path)) || secure_path.empty()) {
@@ -321,8 +416,12 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
       } else if (OB_FAIL(global_val.get_string(secure_path))) {
       }
     }
-    if (OB_SUCC(ret)
-        && OB_FAIL(check_file_path_in_priv(secure_path, table_def->file_path_))) {
+    if (OB_SUCC(ret)) {
+      if (ObFileTableDef::GLOB_FUNC == table_def->func_type_) {
+        if (OB_FAIL(check_glob_pattern_in_priv(secure_path, table_def->file_path_))) {
+        }
+      } else if (OB_FAIL(check_file_path_in_priv(secure_path, table_def->file_path_))) {
+      }
     }
   }
 
@@ -346,6 +445,11 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
       item->file_table_def_ = table_def;
       tbl_item = item;
     }
+  }
+
+  // ColumnItem::add_relation_id() needs the table bit index, so register the
+  // file table before creating its inferred columns.
+  if (OB_SUCC(ret) && OB_FAIL(stmt->add_table_item(session_info_, item))) {
   }
 
   // Infer the schema of the file with the shared format layer.
@@ -412,8 +516,14 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
     sql::ObRawExprResType result_type;
     ObDataType data_type;
     data_type.set_obj_type(col.obj_type_);
-    data_type.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+    if (ob_is_string_type(col.obj_type_)) {
+      data_type.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+      data_type.set_collation_level(CS_LEVEL_IMPLICIT);
+    }
     data_type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[col.obj_type_]);
+    if (ObDateTimeType == col.obj_type_) {
+      data_type.set_scale(0);
+    }
     if (OB_ISNULL(params_.expr_factory_)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_REF_COLUMN, col_expr))) {
@@ -441,8 +551,6 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
     }
   }
 
-  if (OB_SUCC(ret) && OB_FAIL(stmt->add_table_item(session_info_, item))) {
-  }
   return ret;
 }
 

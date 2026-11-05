@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdarg>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -102,7 +103,7 @@ int month_days(int year, int month)
 // 合法的年月日：月份 1-12，日期在该月范围内（自动处理闰年）。
 bool is_valid_ymd(int year, int month, int day)
 {
-  const int days = month_days(year, month);
+  const int days = (year >= 1 && year <= 9999) ? month_days(year, month) : 0;
   return days > 0 && day >= 1 && day <= days;
 }
 
@@ -206,41 +207,50 @@ bool wildcard_match(const std::string &pattern, const std::string &name)
 // 确定性类型推断辅助函数
 // ============================================================================
 
-// BIGINT 文本规则（与评测约定保持一致）：
-//   * 只允许十进制数字，出现前导 '+' / '-' 一律不视为 BIGINT（带显式符号的
-//     文本交给 DOUBLE 兜底）；
-//   * 不允许前导零（"0" 本身除外），这样 "007" 这类编号不会丢前导零；
-//   * 值必须落在 int64 范围内，越界值交给 DOUBLE。
+// BIGINT 文本规则：可选正负号、十进制数字，且值必须完整落在 int64 范围。
+// 手工累加避免依赖 locale，并正确接受 INT64_MIN。
 bool file_text_is_bigint(const std::string &text)
 {
   const size_t n = text.size();
   if (0 == n) {
     return false;
   }
-  if (!is_ascii_digit(text[0])) {
+  size_t i = 0;
+  bool negative = false;
+  if ('+' == text[i] || '-' == text[i]) {
+    negative = '-' == text[i];
+    ++i;
+  }
+  if (i >= n) {
     return false;
   }
-  if (n > 1 && '0' == text[0]) {
-    return false;  // 前导零：可能是编号而不是数字
-  }
-  const uint64_t max_value = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  const uint64_t limit = negative
+      ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1U
+      : static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
   uint64_t value = 0;
-  for (size_t i = 0; i < n; ++i) {
+  for (; i < n; ++i) {
     if (!is_ascii_digit(text[i])) {
       return false;
     }
     const uint64_t digit = static_cast<uint64_t>(text[i] - '0');
-    if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
-      return false;  // 累加溢出，必然超出 int64
+    if (value > (limit - digit) / 10) {
+      return false;
     }
     value = value * 10 + digit;
   }
-  return value <= max_value;
+  return true;
 }
 
 bool file_text_is_double(const std::string &text)
 {
-  return is_double_syntax(text);
+  bool valid = is_double_syntax(text);
+  if (valid) {
+    errno = 0;
+    char *end = NULL;
+    const double value = ::strtod(text.c_str(), &end);
+    valid = 0 == errno && NULL != end && '\0' == *end && std::isfinite(value);
+  }
+  return valid;
 }
 
 // BOOLEAN 只认 true / false（大小写不敏感）；"1"/"0" 属于 BIGINT，不做隐式转换。
@@ -998,14 +1008,78 @@ void CsvFileReader::close()
 }
 
 // ============================================================================
-// 工厂函数
+// GlobFileReader and unified reader factory
 // ============================================================================
+
+class GlobFileReader : public FileFormatReader
+{
+public:
+  explicit GlobFileReader(const std::string &pattern)
+    : pattern_(pattern), schema_(), files_(), pos_(0), error_()
+  {}
+  virtual ~GlobFileReader() {}
+
+  virtual int open() override
+  {
+    files_.clear();
+    schema_.clear();
+    pos_ = 0;
+    error_.clear();
+    schema_.push_back(FileColumnSchema("file", FILE_TYPE_VARCHAR, false));
+    return glob_files(pattern_, files_);
+  }
+
+  virtual const std::vector<FileColumnSchema> &get_schema() const override
+  {
+    return schema_;
+  }
+
+  virtual int next_batch(int64_t max_rows, std::vector<FileRow> &rows, bool &eof) override
+  {
+    int ret = 0;
+    if (max_rows < 0) {
+      ret = -1;
+      error_ = "max_rows must not be negative";
+    } else {
+      while (static_cast<int64_t>(rows.size()) < max_rows && pos_ < files_.size()) {
+        FileRow row;
+        FileCell cell;
+        cell.is_null_ = false;
+        cell.text_ = files_.at(pos_++);
+        row.cells_.push_back(cell);
+        rows.push_back(row);
+      }
+      eof = pos_ >= files_.size();
+    }
+    return ret;
+  }
+
+  virtual void close() override
+  {
+    files_.clear();
+    schema_.clear();
+    pos_ = 0;
+  }
+
+  virtual const std::string &error() const override
+  {
+    return error_;
+  }
+
+private:
+  std::string pattern_;
+  std::vector<FileColumnSchema> schema_;
+  std::vector<std::string> files_;
+  size_t pos_;
+  std::string error_;
+};
 
 int create_file_reader(const std::string &path,
                        const FileReadOptions &options,
                        std::unique_ptr<FileFormatReader> &reader)
 {
   int ret = 0;
+  reader.reset();
   if (FILE_FORMAT_CSV == options.format_) {
     CsvFileReader *csv_reader = new (std::nothrow) CsvFileReader(path, options);
     if (NULL == csv_reader) {
@@ -1013,8 +1087,18 @@ int create_file_reader(const std::string &path,
     } else {
       reader.reset(csv_reader);
     }
+  } else if (FILE_FORMAT_JSONL == options.format_) {
+    ret = create_jsonl_file_reader(path, options, reader);
+  } else if (FILE_FORMAT_PARQUET == options.format_) {
+    ret = create_parquet_file_reader(path, options, reader);
+  } else if (FILE_FORMAT_GLOB == options.format_) {
+    GlobFileReader *glob_reader = new (std::nothrow) GlobFileReader(path);
+    if (NULL == glob_reader) {
+      ret = -1;
+    } else {
+      reader.reset(glob_reader);
+    }
   } else {
-    // JSONL / Parquet / GLOB 由别的实现文件负责
     ret = -1;
   }
   return ret;

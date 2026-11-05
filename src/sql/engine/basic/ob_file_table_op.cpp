@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define USING_LOG_PREFIX SQL_ENGINE
+#define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/basic/ob_file_table_op.h"
 #include "sql/engine/ob_exec_context.h"
@@ -26,6 +26,9 @@ namespace oceanbase
 using namespace common;
 namespace sql
 {
+
+OB_SERIALIZE_MEMBER((ObFileTableSpec, ObOpSpec), column_exprs_, column_idxs_,
+                    file_path_, format_, header_);
 
 namespace
 {
@@ -39,6 +42,19 @@ int64_t civil_to_days(int64_t y, int64_t m, int64_t d)
   const int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
   const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   return era * 146097 + doe - 719468;
+}
+
+bool parse_four(const char *p, int64_t &v)
+{
+  bool ok = p[0] >= '0' && p[0] <= '9'
+         && p[1] >= '0' && p[1] <= '9'
+         && p[2] >= '0' && p[2] <= '9'
+         && p[3] >= '0' && p[3] <= '9';
+  if (ok) {
+    v = (p[0] - '0') * 1000 + (p[1] - '0') * 100
+      + (p[2] - '0') * 10 + (p[3] - '0');
+  }
+  return ok;
 }
 
 bool parse_two(const char *p, int64_t &v)
@@ -66,22 +82,34 @@ ObFileTableOp::ObFileTableOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOp
 int ObFileTableOp::open_reader()
 {
   int ret = OB_SUCCESS;
+  int reader_ret = 0;
   const ObFileTableSpec &spec = static_cast<const ObFileTableSpec &>(spec_);
   file_sql::FileReadOptions options;
-  switch (spec.format_) {
-    case 1: options.format_ = file_sql::FILE_FORMAT_JSONL; break;
-    case 2: options.format_ = file_sql::FILE_FORMAT_PARQUET; break;
-    case 3: options.format_ = file_sql::FILE_FORMAT_GLOB; break;
-    default: options.format_ = file_sql::FILE_FORMAT_CSV; break;
-  }
+  options.format_ = static_cast<file_sql::FileFormat>(spec.format_);
   options.header_ = spec.header_;
   std::string path(spec.file_path_.ptr(), spec.file_path_.length());
-  if (0 != file_sql::create_file_reader(path, options, reader_) || nullptr == reader_.get()) {
+  if (0 != (reader_ret = file_sql::create_file_reader(path, options, reader_))
+      || nullptr == reader_.get()) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (0 != reader_->open()) {
+    LOG_WARN("failed to create file reader", K(ret), K(reader_ret), K(path.c_str()),
+             K(spec.format_), K(spec.column_exprs_.count()));
+  } else if (0 != (reader_ret = reader_->open())) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (reader_->get_schema().size() != static_cast<size_t>(spec.column_exprs_.count())) {
+    LOG_WARN("failed to open file reader", K(ret), K(reader_ret), K(path.c_str()),
+             K(spec.format_), K(reader_->error().c_str()));
+  } else if (spec.column_exprs_.count() != spec.column_idxs_.count()) {
     ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file table expression and column index counts differ", K(ret),
+             K(spec.column_exprs_.count()), K(spec.column_idxs_.count()));
+  } else {
+    const int64_t schema_count = static_cast<int64_t>(reader_->get_schema().size());
+    for (int64_t i = 0; OB_SUCC(ret) && i < spec.column_idxs_.count(); ++i) {
+      if (spec.column_idxs_.at(i) < 0 || spec.column_idxs_.at(i) >= schema_count) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("file table column index is outside reader schema", K(ret), K(path.c_str()),
+                 K(i), K(spec.column_idxs_.at(i)), K(schema_count));
+      }
+    }
   }
   batch_.clear();
   batch_pos_ = 0;
@@ -166,9 +194,9 @@ int ObFileTableOp::set_cell_datum(ObExpr *expr, int64_t column_type, const file_
         case file_sql::FILE_TYPE_DATE: {
           int64_t y = 0, m = 0, d = 0;
           const int64_t len = static_cast<int64_t>(cell.text_.size());
-          if (len >= 10 && parse_two(p, y) && parse_two(p + 2, m) && parse_two(p + 5, d)
+          if (len >= 10 && parse_four(p, y) && parse_two(p + 5, m) && parse_two(p + 8, d)
               && '-' == p[4] && '-' == p[7]) {
-            datum.set_date(static_cast<int32_t>(civil_to_days(2000 + y, m, d)));
+            datum.set_date(static_cast<int32_t>(civil_to_days(y, m, d)));
           } else {
             datum.set_null();
           }
@@ -178,11 +206,12 @@ int ObFileTableOp::set_cell_datum(ObExpr *expr, int64_t column_type, const file_
           int64_t y = 0, m = 0, d = 0, hh = 0, mi = 0, ss = 0;
           const int64_t len = static_cast<int64_t>(cell.text_.size());
           if (len >= 19 && '-' == p[4] && '-' == p[7]
-              && (':' == p[13]) && ':' == p[16]
-              && parse_two(p, y) && parse_two(p + 2, m) && parse_two(p + 5, d)
+              && (' ' == p[10] || 'T' == p[10])
+              && ':' == p[13] && ':' == p[16]
+              && parse_four(p, y) && parse_two(p + 5, m) && parse_two(p + 8, d)
               && parse_two(p + 11, hh) && parse_two(p + 14, mi) && parse_two(p + 17, ss)) {
-            const int64_t days = civil_to_days(2000 + y, m, d);
-            datum.set_datetime(static_cast<int64_t>(days) * 86400 + hh * 3600 + mi * 60 + ss);
+            const int64_t seconds = civil_to_days(y, m, d) * 86400 + hh * 3600 + mi * 60 + ss;
+            datum.set_datetime(seconds * 1000000L);
           } else {
             datum.set_null();
           }
@@ -202,7 +231,7 @@ int ObFileTableOp::set_cell_datum(ObExpr *expr, int64_t column_type, const file_
       }
     }
     if (OB_SUCC(ret)) {
-      expr->set_evaluated_flag(eval_ctx_);
+      expr->set_evaluated_projected(eval_ctx_);
     }
   }
   return ret;
@@ -212,12 +241,29 @@ int ObFileTableOp::fill_row_datums(const file_sql::FileRow &row)
 {
   int ret = OB_SUCCESS;
   const ObFileTableSpec &spec = static_cast<const ObFileTableSpec &>(spec_);
-  if (row.cells_.size() != static_cast<size_t>(spec.column_exprs_.count())) {
+  if (spec.column_exprs_.count() != spec.column_idxs_.count()) {
     ret = OB_ERR_UNEXPECTED;
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < spec.column_exprs_.count(); ++i) {
-      ObExpr *expr = spec.column_exprs_.at(i);
-      if (OB_FAIL(set_cell_datum(expr, 0, row.cells_.at(i)))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < spec.column_exprs_.count(); ++i) {
+    const int64_t source_idx = spec.column_idxs_.at(i);
+    ObExpr *expr = spec.column_exprs_.at(i);
+    if (source_idx < 0 || source_idx >= static_cast<int64_t>(row.cells_.size())
+        || OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid file table row projection", K(ret), K(i), K(source_idx),
+               K(row.cells_.size()), KP(expr));
+    } else {
+      const ObObjType obj_type = expr->datum_meta_.type_;
+      int64_t logical_type = file_sql::FILE_TYPE_VARCHAR;
+      switch (obj_type) {
+        case ObTinyIntType: logical_type = file_sql::FILE_TYPE_BOOLEAN; break;
+        case ObIntType: logical_type = file_sql::FILE_TYPE_BIGINT; break;
+        case ObDoubleType: logical_type = file_sql::FILE_TYPE_DOUBLE; break;
+        case ObDateType: logical_type = file_sql::FILE_TYPE_DATE; break;
+        case ObDateTimeType: logical_type = file_sql::FILE_TYPE_DATETIME; break;
+        default: logical_type = file_sql::FILE_TYPE_VARCHAR; break;
+      }
+      if (OB_FAIL(set_cell_datum(expr, logical_type, row.cells_.at(source_idx)))) {
       }
     }
   }
@@ -227,7 +273,7 @@ int ObFileTableOp::fill_row_datums(const file_sql::FileRow &row)
 int ObFileTableOp::inner_get_next_row()
 {
   int ret = OB_SUCCESS;
-  const ObFileTableSpec &spec = static_cast<const ObFileTableSpec &>(spec_);
+  clear_evaluated_flag();
   while (OB_SUCC(ret) && (batch_pos_ >= static_cast<int64_t>(batch_.size()))) {
     batch_.clear();
     batch_pos_ = 0;
@@ -236,6 +282,7 @@ int ObFileTableOp::inner_get_next_row()
       ret = OB_NOT_INIT;
     } else if (0 != reader_->next_batch(BATCH_SIZE, batch_, eof)) {
       ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to read next file batch", K(ret), K(reader_->error().c_str()));
     } else {
       eof_ = eof;
       if (batch_.empty()) {
@@ -246,24 +293,7 @@ int ObFileTableOp::inner_get_next_row()
   if (OB_SUCC(ret)) {
     row_alloc_.reset();
     const file_sql::FileRow &row = batch_.at(batch_pos_++);
-    if (row.cells_.size() != static_cast<size_t>(spec.column_exprs_.count())) {
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < row.cells_.size(); ++i) {
-        // the column type is carried by the expression meta
-        const ObObjType obj_type = spec.column_exprs_.at(i)->datum_meta_.type_;
-        int64_t logical_type = file_sql::FILE_TYPE_VARCHAR;
-        switch (obj_type) {
-          case ObTinyIntType: logical_type = file_sql::FILE_TYPE_BOOLEAN; break;
-          case ObIntType: logical_type = file_sql::FILE_TYPE_BIGINT; break;
-          case ObDoubleType: logical_type = file_sql::FILE_TYPE_DOUBLE; break;
-          case ObDateType: logical_type = file_sql::FILE_TYPE_DATE; break;
-          case ObDateTimeType: logical_type = file_sql::FILE_TYPE_DATETIME; break;
-          default: logical_type = file_sql::FILE_TYPE_VARCHAR; break;
-        }
-        if (OB_FAIL(set_cell_datum(spec.column_exprs_.at(i), logical_type, row.cells_.at(i)))) {
-        }
-      }
+    if (OB_FAIL(fill_row_datums(row))) {
     }
   }
   return ret;

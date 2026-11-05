@@ -128,6 +128,12 @@ public:
 int create_file_reader(const std::string &path,
                        const FileReadOptions &options,
                        std::unique_ptr<FileFormatReader> &reader);
+int create_jsonl_file_reader(const std::string &path,
+                             const FileReadOptions &options,
+                             std::unique_ptr<FileFormatReader> &reader);
+int create_parquet_file_reader(const std::string &path,
+                               const FileReadOptions &options,
+                               std::unique_ptr<FileFormatReader> &reader);
 
 // glob(): lists the regular files matching a shell style pattern, sorted by
 // name. Only '*' and '?' wildcards and a literal directory are supported.
