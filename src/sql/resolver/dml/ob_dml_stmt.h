@@ -129,6 +129,40 @@ struct ObValuesTableDef {
                        K(access_type_), K(is_const_), K(column_types_));
 };
 
+struct ObFileColumnDef
+{
+  ObFileColumnDef() : column_name_(), obj_type_(ObNullType), nullable_(true) {}
+  common::ObString column_name_;
+  ObObjType obj_type_;
+  bool nullable_;
+  TO_STRING_KV(K_(column_name), K_(obj_type), K_(nullable));
+};
+
+// File as database: metadata of read_csv()/read_json()/read_parquet()/glob()
+// resolved at resolve time, the column list is inferred from the file.
+struct ObFileTableDef
+{
+  enum FileFuncType
+  {
+    READ_CSV = 0,
+    READ_JSON = 1,
+    READ_NDJSON = 2,
+    READ_PARQUET = 3,
+    GLOB_FUNC = 4,
+  };
+  ObFileTableDef()
+    : func_type_(READ_CSV), header_(true), sample_size_(-1), format_(),
+      file_path_(), wildcard_(), columns_() {}
+  int64_t func_type_;
+  bool header_;
+  int64_t sample_size_;
+  common::ObString format_;
+  common::ObString file_path_;
+  common::ObString wildcard_;
+  common::ObSEArray<ObFileColumnDef, 8, common::ModulePageAllocator, true> columns_;
+  TO_STRING_KV(K_(func_type), K_(file_path), K_(format), K_(columns));
+};
+
 struct TableItem
 {
   TableItem()
@@ -153,6 +187,7 @@ struct TableItem
     ddl_schema_version_ = 0;
     ddl_table_id_ = common::OB_INVALID_ID;
     json_table_def_ = nullptr;
+    file_table_def_ = nullptr;
     table_type_ = MAX_TABLE_TYPE;
     values_table_def_ = NULL;
     sample_info_ = nullptr;
@@ -190,6 +225,7 @@ struct TableItem
     JSON_TABLE,
     VALUES_TABLE,
     LATERAL_TABLE,
+    FILE_TABLE,
   };
 
   /**
@@ -226,6 +262,7 @@ struct TableItem
   bool is_values_table() const { return VALUES_TABLE == type_; }//used to mark values statement: values row(1,2), row(3,4);
 
   bool is_lateral_table() const { return LATERAL_TABLE == type_; }
+  bool is_file_table() const { return FILE_TABLE == type_; }
   bool is_extended_all_or_user_sys_view() const
   {
     return (is_extended_sys_view_table(ref_id_) && (table_name_.prefix_match("USER_") || table_name_.prefix_match("ALL_")));
@@ -301,6 +338,8 @@ struct TableItem
   common::ObSEArray<ObExecParamRawExpr*, 4, common::ModulePageAllocator, true> exec_params_;
   // json table
   ObJsonTableDef *json_table_def_;
+  // file table (read_csv/read_json/read_parquet/glob)
+  ObFileTableDef *file_table_def_;
   // values table
   ObValuesTableDef *values_table_def_;
   // sample scan infos
