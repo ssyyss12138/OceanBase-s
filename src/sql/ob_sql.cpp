@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
+#include <string>
+#include <ctype.h>
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -1209,6 +1211,23 @@ int ObSql::handle_sql_execute(const ObString &sql,
     ret = OB_INVALID_ARGUMENT;
   } else {
     use_plan_cache = session->get_local_ob_enable_plan_cache();
+    if (use_plan_cache && NULL != sql.ptr() && sql.length() > 0) {
+      // "file as database": the file path of read_csv()/read_json()/
+      // read_ndjson()/read_parquet()/glob() is resolved at resolve time while
+      // the literal is parameterized, so a cached plan must never be reused
+      // for a statement that reads a local file.
+      std::string lower(sql.ptr(), static_cast<size_t>(sql.length()));
+      for (size_t i = 0; i < lower.size(); ++i) {
+        lower[i] = static_cast<char>(::tolower(static_cast<unsigned char>(lower[i])));
+      }
+      if (std::string::npos != lower.find("read_csv(")
+          || std::string::npos != lower.find("read_json(")
+          || std::string::npos != lower.find("read_ndjson(")
+          || std::string::npos != lower.find("read_parquet(")
+          || std::string::npos != lower.find("glob(")) {
+        use_plan_cache = false;
+      }
+    }
   }
 
   ObPlanCacheCtx pc_ctx(sql, mode, allocator, context, ectx);
@@ -1960,6 +1979,22 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   ObExecContext& ectx = result.get_exec_context();
   int get_plan_err = OB_SUCCESS; //used for judge whether add plan to plan cache
   bool use_plan_cache = session.get_local_ob_enable_plan_cache();
+  if (use_plan_cache && trimed_stmt.length() > 0) {
+    // "file as database": the local file path is fixed at resolve time while
+    // the SQL literal is parameterized, so such statements must not reuse a
+    // plan that was built for a different file.
+    std::string lower(trimed_stmt.ptr(), static_cast<size_t>(trimed_stmt.length()));
+    for (size_t i = 0; i < lower.size(); ++i) {
+      lower[i] = static_cast<char>(::tolower(static_cast<unsigned char>(lower[i])));
+    }
+    if (std::string::npos != lower.find("read_csv(")
+        || std::string::npos != lower.find("read_json(")
+        || std::string::npos != lower.find("read_ndjson(")
+        || std::string::npos != lower.find("read_parquet(")
+        || std::string::npos != lower.find("glob(")) {
+      use_plan_cache = false;
+    }
+  }
   ObPlanCacheCtx *pc_ctx = NULL;
   bool is_begin_commit_stmt = false;
 
