@@ -26,6 +26,7 @@ namespace storage
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
+    binary_ids_(false),
     is_inited_(false)
 {
 }
@@ -38,7 +39,12 @@ int ObSRMergeCmp::init(
   if (OB_ISNULL(iter_ids)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    iter_ids_ = iter_ids;
+    // The fixed array is allocated once before the merger is initialized and
+    // does not resize during iteration. Avoid two virtual at() calls per key
+    // comparison on posting lists.
+    iter_ids_ = iter_ids->count() > 0 ? &iter_ids->at(0) : nullptr;
+    binary_ids_ = common::ObVarcharType == id_meta.type_
+        && common::CS_TYPE_BINARY == id_meta.cs_type_;
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
@@ -60,8 +66,12 @@ int ObSRMergeCmp::cmp(
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
+    const ObDatum &left_id = get_id_datum(l.iter_idx_);
+    const ObDatum &right_id = get_id_datum(r.iter_idx_);
+    if (binary_ids_ && !left_id.is_null() && !right_id.is_null()) {
+      // CS_TYPE_BINARY has bytewise, non-padding comparison semantics.
+      cmp_ret = left_id.get_string().compare(right_id.get_string());
+    } else if (OB_FAIL(cmp_func_(left_id, right_id, tmp_ret, nullptr))) {
     } else {
       cmp_ret = tmp_ret;
     }
@@ -352,6 +362,18 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
   ObExpr *filter_expr = iter_param_->filter_expr_;
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
+  // Fuse only the pure DOUBLE-to-BOOL predicate over this exact score slot.
+  // Threshold predicates, arbitrary expressions and scalar execution retain
+  // the existing evaluator. This is the same zero comparison as ObExprBool.
+  if (eval_ctx->is_vectorized() && nullptr != filter_expr && nullptr != relevance_proj_expr
+      && count < eval_ctx->max_batch_size_
+      && T_OP_BOOL == filter_expr->type_ && 1 == filter_expr->arg_cnt_
+      && filter_expr->args_[0] == relevance_proj_expr
+      && (common::ObDoubleType == relevance_proj_expr->datum_meta_.type_
+          || common::ObUDoubleType == relevance_proj_expr->datum_meta_.type_)) {
+    need_project = 0.0 != relevance;
+    return OB_SUCCESS;
+  }
   ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
   if (!iter_param_->need_filter()) {
@@ -415,7 +437,28 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
   ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
-  if (eval_ctx->is_vectorized()) {
+  if (eval_ctx->is_vectorized() && id_proj_expr->is_batch_result()
+      && (!iter_param_->need_project_relevance() || relevance_proj_expr->is_batch_result())) {
+    // The result buffers and expression frames are contiguous. Locate them
+    // once for the batch rather than updating BatchInfoScopeGuard and the
+    // same expression metadata separately for every posting-list result.
+    ObDatum *id_datums = id_proj_expr->locate_datums_for_update(*eval_ctx, count);
+    const ObDocIdExt *ids = &buffered_domain_ids_.at(0);
+    for (int64_t i = 0; i < count; ++i) {
+      set_datum_func_(id_datums[i], ids[i]);
+    }
+    id_proj_expr->get_evaluated_flags(*eval_ctx).set_all(count);
+    id_proj_expr->set_evaluated_projected(*eval_ctx);
+    if (iter_param_->need_project_relevance()) {
+      ObDatum *relevance_datums = relevance_proj_expr->locate_datums_for_update(*eval_ctx, count);
+      const double *scores = &buffered_relevances_.at(0);
+      for (int64_t i = 0; i < count; ++i) {
+        relevance_datums[i].set_double(scores[i]);
+      }
+      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set_all(count);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
+  } else if (eval_ctx->is_vectorized()) {
     sql::ObBitVector &id_evaluated_flags = id_proj_expr->get_evaluated_flags(*eval_ctx);
     for (int64_t i = 0; i < count; ++i) {
       guard.set_batch_idx(i);

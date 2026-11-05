@@ -1,0 +1,61 @@
+# Preserve tokenizer aggregation, dictionary boundary ordering and batched
+# retrieval projection while removing work from their hot paths.
+--disable_warnings
+DROP DATABASE IF EXISTS fts_hot_path_consistency;
+CREATE DATABASE fts_hot_path_consistency;
+--enable_warnings
+USE fts_hot_path_consistency;
+
+SELECT TOKENIZE('Alpha ALPHA alpha beta BETA gamma the THE with www', 'beng', '[{"output":"all"}]') AS tokens;
+SELECT TOKENIZE('the thé THE thé, und UND www WWW café ÉCOLE', 'beng', '[{"output":"all"}]') AS tokens;
+SELECT TOKENIZE('日本語テスト 한글 테스트 😀🙂 𠮷 𠀀', 'beng', '[{"output":"all"}]') AS tokens;
+SELECT TOKENIZE('École école naïve CAFÉ Straße STRASSE', 'ngram', '[{"output":"all"}]') AS tokens;
+SELECT TOKENIZE('abc abc ABC abc123 xyz_xyz a aa aaa 123', 'space', '[{"output":"all"}]') AS tokens;
+SELECT TOKENIZE('数据库全文索引，中华人民共和国人民大会堂，OceanBase 2026 中文。', 'ik', '[{"output":"all"}]') AS tokens;
+SELECT TOKENIZE('中华人民共和国人民大会堂 一百二十三个人 😀 日本語 한국어', 'ik', '[{"output":"all"},{"additional_args":[{"ik_mode":"max_word"}]}]') AS tokens;
+SELECT TOKENIZE('', 'beng', '[{"output":"all"}]') AS tokens;
+
+CREATE TABLE docs (
+  id INT PRIMARY KEY,
+  body TEXT,
+  FULLTEXT INDEX fi(body) WITH PARSER beng
+);
+INSERT INTO docs VALUES
+ (0,'alpha alpha beta'), (1,'beta gamma'), (2,'alpha gamma gamma'),
+ (3,'delta'), (4,'alpha beta gamma'), (5,'beta beta'),
+ (6,''), (7,NULL);
+INSERT INTO docs SELECT id+8,body FROM docs;
+INSERT INTO docs SELECT id+16,body FROM docs;
+INSERT INTO docs SELECT id+32,body FROM docs;
+INSERT INTO docs SELECT id+64,body FROM docs;
+INSERT INTO docs SELECT id+128,body FROM docs;
+INSERT INTO docs SELECT id+256,body FROM docs;
+INSERT INTO docs SELECT id+512,body FROM docs;
+
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha gamma');
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 7 OFFSET 3) t;
+SELECT COUNT(*),SUM(CASE WHEN MATCH(body) AGAINST('alpha beta') THEN 1 ELSE 0 END)
+ FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta') > 0.2;
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta') = 0;
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta') OR MOD(id,3)=0;
+SELECT id,ROUND(MATCH(body) AGAINST('alpha beta'),8) AS relevance FROM docs
+ WHERE MATCH(body) AGAINST('alpha beta') ORDER BY relevance DESC,id LIMIT 12;
+
+PREPARE query_by_term FROM 'SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST(?)';
+SET @term='alpha';
+EXECUTE query_by_term USING @term;
+SET @term='beta gamma';
+EXECUTE query_by_term USING @term;
+SET @term='absenttoken';
+EXECUTE query_by_term USING @term;
+DEALLOCATE PREPARE query_by_term;
+
+UPDATE docs SET body='gamma delta delta' WHERE MOD(id,7)=0;
+DELETE FROM docs WHERE MOD(id,5)=0;
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('gamma delta');
+SELECT id,ROUND(MATCH(body) AGAINST('alpha beta'),8) AS relevance FROM docs
+ WHERE MATCH(body) AGAINST('alpha beta') ORDER BY relevance DESC,id LIMIT 12;
+DROP DATABASE fts_hot_path_consistency;

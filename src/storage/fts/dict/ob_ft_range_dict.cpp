@@ -383,14 +383,11 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   int ret = OB_SUCCESS;
   bool found = false;
   for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+    // Range bounds use UTF8MB4_BIN, whose strnncoll is bytewise memcmp
+    // followed by the length difference. ObString::compare has that exact
+    // ordering without looking up and validating the charset twice per range.
+    if (range_dicts_[i].start_.get_word().compare(single_word) <= 0
+        && range_dicts_[i].end_.get_word().compare(single_word) >= 0) {
       dict = range_dicts_[i].dict_;
       found = true;
     }

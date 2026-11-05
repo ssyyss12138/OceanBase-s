@@ -27,6 +27,69 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+// The built-in list consists of ASCII words. Keep its ASCII lookup separate
+// from the collation-aware path, which is still required for accented words
+// such as "thé" and for non-UTF8 input. This table is immutable after its
+// thread-safe function-local initialization and allocates no memory.
+struct AsciiStopWords
+{
+  static constexpr int64_t BUCKET_COUNT = 128;
+  uint64_t keys_[BUCKET_COUNT] = {};
+  bool complete_ = true;
+
+  static bool pack(const ObString &word, uint64_t &key)
+  {
+    key = 0;
+    for (int64_t i = 0; i < word.length(); ++i) {
+      unsigned char ch = static_cast<unsigned char>(word.ptr()[i]);
+      if (ch >= 'A' && ch <= 'Z') {
+        ch += 'a' - 'A';
+      }
+      if (ch < 'a' || ch > 'z') {
+        return false;
+      }
+      if (i < sizeof(key)) {
+        key |= static_cast<uint64_t>(ch) << (8 * i);
+      }
+    }
+    return true;
+  }
+
+  static int64_t bucket(uint64_t key)
+  {
+    return (key ^ (key >> 17) ^ (key >> 37)) & (BUCKET_COUNT - 1);
+  }
+
+  AsciiStopWords()
+  {
+    for (const auto &entry : ob_stop_word_list) {
+      const ObString word(static_cast<int32_t>(STRLEN(entry)), entry);
+      uint64_t key = 0;
+      if (word.length() > sizeof(key) || !pack(word, key) || 0 == key) {
+        complete_ = false;
+      } else {
+        int64_t slot = bucket(key);
+        while (0 != keys_[slot] && key != keys_[slot]) {
+          slot = (slot + 1) & (BUCKET_COUNT - 1);
+        }
+        keys_[slot] = key;
+      }
+    }
+  }
+
+  bool contains(uint64_t key) const
+  {
+    int64_t slot = bucket(key);
+    while (0 != keys_[slot] && key != keys_[slot]) {
+      slot = (slot + 1) & (BUCKET_COUNT - 1);
+    }
+    return key == keys_[slot];
+  }
+};
+} // namespace
+
 ////////////////////////////////////////////////////////////////////////////////
 // class ObStopWordChecker
 ObStopWordChecker::~ObStopWordChecker()
@@ -76,12 +139,21 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   int ret = OB_SUCCESS;
   
   
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
+    if (CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(word.get_collation_type())) {
+      static const AsciiStopWords ascii_words;
+      uint64_t key = 0;
+      const ObString text = word.get_word().get_string();
+      if (ascii_words.complete_ && AsciiStopWords::pack(text, key)) {
+        is_stopword = text.length() <= sizeof(key) && ascii_words.contains(key);
+        return OB_SUCCESS;
+      }
+    }
+    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     common::ObString cmp_str;
     // do nothing set out with in if type is the same.
     if (OB_FAIL(common::ObCharset::charset_convert(
@@ -198,21 +270,21 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
-    }
+    auto increment = [&word, word_freq](common::hash::HashMapPair<ObFTWord, int64_t> &entry) {
+      // Collation-equivalent spellings can have different bytes. The former
+      // set_refactored overwrite retained the most recent spelling, too.
+      entry.first = word;
+      entry.second += word_freq;
+    };
+    // Preserve the existing initial count and representative key while combining the
+    // duplicate lookup and update into a single hash-table probe.
+    ret = word_map_.set_or_update(word, 1, increment);
   }
   return ret;
 }

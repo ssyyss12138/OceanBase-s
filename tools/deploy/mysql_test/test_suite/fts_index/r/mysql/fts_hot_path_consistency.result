@@ -1,0 +1,118 @@
+DROP DATABASE IF EXISTS fts_hot_path_consistency;
+CREATE DATABASE fts_hot_path_consistency;
+USE fts_hot_path_consistency;
+SELECT TOKENIZE('Alpha ALPHA alpha beta BETA gamma the THE with www', 'beng', '[{"output":"all"}]') AS tokens;
+tokens
+{"tokens": [{"gamma": 1}, {"alpha": 3}, {"beta": 2}], "doc_len": 6}
+SELECT TOKENIZE('the thé THE thé, und UND www WWW café ÉCOLE', 'beng', '[{"output":"all"}]') AS tokens;
+tokens
+{"tokens": [{"café": 1}, {"école": 1}], "doc_len": 2}
+SELECT TOKENIZE('日本語テスト 한글 테스트 😀🙂 𠮷 𠀀', 'beng', '[{"output":"all"}]') AS tokens;
+tokens
+{"tokens": [{"한글": 1}, {"😀🙂": 1}, {"테스트": 1}, {"𠀀": 2}, {"日本語テスト": 1}], "doc_len": 6}
+SELECT TOKENIZE('École école naïve CAFÉ Straße STRASSE', 'ngram', '[{"output":"all"}]') AS tokens;
+tokens
+{"tokens": [{"st": 2}, {"ss": 1}, {"le": 2}, {"ïv": 1}, {"af": 1}, {"ol": 2}, {"ca": 1}, {"se": 2}, {"ve": 1}, {"tr": 2}, {"co": 2}, {"na": 1}, {"as": 2}, {"éc": 2}, {"fé": 1}, {"ra": 2}, {"aï": 1}], "doc_len": 26}
+SELECT TOKENIZE('abc abc ABC abc123 xyz_xyz a aa aaa 123', 'space', '[{"output":"all"}]') AS tokens;
+tokens
+{"tokens": [{"123": 1}, {"aaa": 1}, {"xyz_xyz": 1}, {"abc123": 1}, {"abc": 3}], "doc_len": 7}
+SELECT TOKENIZE('数据库全文索引，中华人民共和国人民大会堂，OceanBase 2026 中文。', 'ik', '[{"output":"all"}]') AS tokens;
+tokens
+{"tokens": [{"人民大会堂": 1}, {"oceanbase": 1}, {"数据库": 1}, {"中文": 1}, {"中华人民共和国": 1}, {"全文索引": 1}, {"2026": 1}], "doc_len": 7}
+SELECT TOKENIZE('中华人民共和国人民大会堂 一百二十三个人 😀 日本語 한국어', 'ik', '[{"output":"all"},{"additional_args":[{"ik_mode":"max_word"}]}]') AS tokens;
+tokens
+{"tokens": [{"大会": 1}, {"人民大会堂": 1}, {"大会堂": 1}, {"共和国": 1}, {"个人": 1}, {"十三": 1}, {"人民大会": 1}, {"人民共和国": 1}, {"국": 1}, {"中华人民": 1}, {"한": 1}, {"共和": 1}, {"一百二十三": 1}, {"어": 1}, {"百二": 1}, {"語": 1}, {"二十": 1}, {"三个": 1}, {"会堂": 1}, {"中华": 1}, {"十三个": 1}, {"中华人民共和国": 1}, {"日本": 1}, {"国人": 1}, {"华人": 1}, {"人民": 2}, {"二十三": 1}], "doc_len": 28}
+SELECT TOKENIZE('', 'beng', '[{"output":"all"}]') AS tokens;
+tokens
+{"tokens": [], "doc_len": 0}
+CREATE TABLE docs (
+id INT PRIMARY KEY,
+body TEXT,
+FULLTEXT INDEX fi(body) WITH PARSER beng
+);
+INSERT INTO docs VALUES
+(0,'alpha alpha beta'), (1,'beta gamma'), (2,'alpha gamma gamma'),
+(3,'delta'), (4,'alpha beta gamma'), (5,'beta beta'),
+(6,''), (7,NULL);
+INSERT INTO docs SELECT id+8,body FROM docs;
+INSERT INTO docs SELECT id+16,body FROM docs;
+INSERT INTO docs SELECT id+32,body FROM docs;
+INSERT INTO docs SELECT id+64,body FROM docs;
+INSERT INTO docs SELECT id+128,body FROM docs;
+INSERT INTO docs SELECT id+256,body FROM docs;
+INSERT INTO docs SELECT id+512,body FROM docs;
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+COUNT(*)	SUM(id)
+640	326656
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha gamma');
+COUNT(*)	SUM(id)
+512	260992
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 7 OFFSET 3) t;
+COUNT(*)
+7
+SELECT COUNT(*),SUM(CASE WHEN MATCH(body) AGAINST('alpha beta') THEN 1 ELSE 0 END)
+FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+COUNT(*)	SUM(CASE WHEN MATCH(body) AGAINST('alpha beta') THEN 1 ELSE 0 END)
+640	640
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta') > 0.2;
+COUNT(*)	SUM(id)
+640	326656
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta') = 0;
+COUNT(*)	SUM(id)
+384	197120
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta') OR MOD(id,3)=0;
+COUNT(*)	SUM(id)
+769	392704
+SELECT id,ROUND(MATCH(body) AGAINST('alpha beta'),8) AS relevance FROM docs
+WHERE MATCH(body) AGAINST('alpha beta') ORDER BY relevance DESC,id LIMIT 12;
+id	relevance
+0	1.22399297
+8	1.22399297
+16	1.22399297
+24	1.22399297
+32	1.22399297
+40	1.22399297
+48	1.22399297
+56	1.22399297
+64	1.22399297
+72	1.22399297
+80	1.22399297
+88	1.22399297
+PREPARE query_by_term FROM 'SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST(?)';
+SET @term='alpha';
+EXECUTE query_by_term USING @term;
+COUNT(*)	SUM(id)
+384	195840
+SET @term='beta gamma';
+EXECUTE query_by_term USING @term;
+COUNT(*)	SUM(id)
+640	326656
+SET @term='absenttoken';
+EXECUTE query_by_term USING @term;
+COUNT(*)	SUM(id)
+0	NULL
+DEALLOCATE PREPARE query_by_term;
+UPDATE docs SET body='gamma delta delta' WHERE MOD(id,7)=0;
+DELETE FROM docs WHERE MOD(id,5)=0;
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+COUNT(*)	SUM(id)
+438	223818
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('gamma delta');
+COUNT(*)	SUM(id)
+470	239574
+SELECT id,ROUND(MATCH(body) AGAINST('alpha beta'),8) AS relevance FROM docs
+WHERE MATCH(body) AGAINST('alpha beta') ORDER BY relevance DESC,id LIMIT 12;
+id	relevance
+8	2.73081498
+16	2.73081498
+24	2.73081498
+32	2.73081498
+48	2.73081498
+64	2.73081498
+72	2.73081498
+88	2.73081498
+96	2.73081498
+104	2.73081498
+128	2.73081498
+136	2.73081498
+DROP DATABASE fts_hot_path_consistency;
