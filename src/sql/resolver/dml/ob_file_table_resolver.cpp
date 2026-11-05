@@ -28,6 +28,9 @@
 #include "sql/engine/basic/ob_file_format_reader.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "share/ob_errno.h"
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 
 namespace oceanbase
 {
@@ -74,7 +77,7 @@ bool get_bool_literal(const ParseNode *node, bool &value)
     if (T_BOOL == node->type_) {
       value = (1 == node->value_);
       found = true;
-    } else if (T_INTNUM == node->type_) {
+    } else if (T_NUMBER == node->type_) {
       value = (0 != node->value_);
       found = true;
     }
@@ -144,6 +147,43 @@ int dedup_file_column_names(ObIArray<ObFileColumnDef> &columns, ObIAllocator &al
           }
         }
       }
+    }
+  }
+  return ret;
+}
+
+
+// Canonicalizes both paths and verifies that the file lives inside
+// secure_file_priv. Returns OB_ERR_NO_PRIVILEGE when it escapes.
+int check_file_path_in_priv(const ObString &priv, const ObString &path)
+{
+  int ret = OB_SUCCESS;
+  char buf[PATH_MAX] = {0};
+  std::string canon_path;
+  std::string canon_priv;
+  std::string path_str(path.ptr(), path.length());
+  std::string priv_str(priv.ptr(), priv.length());
+  if (NULL == ::realpath(path_str.c_str(), buf)) {
+    ret = OB_ERR_NO_PRIVILEGE;
+  } else {
+    canon_path.assign(buf);
+    MEMSET(buf, 0, sizeof(buf));
+    if (NULL == ::realpath(priv_str.c_str(), buf)) {
+      canon_priv = priv_str;
+    } else {
+      canon_priv.assign(buf);
+    }
+    if (canon_priv.empty()) {
+      ret = OB_ERR_NO_PRIVILEGE;
+    } else if ("/" == canon_priv || canon_path == canon_priv) {
+      ret = OB_SUCCESS;
+    } else if (0 == canon_path.compare(0, canon_priv.size(), canon_priv)
+               && canon_path.size() > canon_priv.size()
+               && '/' == canon_path[canon_priv.size()]) {
+      ret = OB_SUCCESS;
+    } else {
+      // the file must also be a regular file
+      ret = OB_ERR_NO_PRIVILEGE;
     }
   }
   return ret;
@@ -229,16 +269,16 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
       } else if (0 == arg_name.case_compare("sample_size")) {
         // Only a full file scan is supported by design.
         bool is_all = false;
-        if (NULL != value_node && T_INTNUM == value_node->type_ && -1 == value_node->value_) {
+        if (NULL != value_node && T_NUMBER == value_node->type_ && -1 == value_node->value_) {
           is_all = true;
         } else if (NULL != value_node && T_OP_NEG == value_node->type_
                    && 1 == value_node->num_child_ && NULL != value_node->children_[0]
-                   && T_INTNUM == value_node->children_[0]->type_
+                   && T_NUMBER == value_node->children_[0]->type_
                    && 1 == value_node->children_[0]->value_) {
           is_all = true;
         }
         if (!is_all) {
-          ret = OB_ERR_NOT_SUPPORTED_YET;
+          ret = OB_NOT_SUPPORTED;
           LOG_WARN("only sample_size = -1 is supported", K(ret));
         }
       } else if (0 == arg_name.case_compare("format")) {
@@ -269,8 +309,20 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
   // Secure path check: the resolved file must be inside secure_file_priv.
   if (OB_SUCC(ret) && ObFileTableDef::GLOB_FUNC != table_def->func_type_) {
     ObString secure_path;
-    if (OB_FAIL(session_info_->get_secure_file_priv(secure_path))) {
-    } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_path, table_def->file_path_))) {
+    ObObj global_val;
+    if (OB_FAIL(session_info_->get_secure_file_priv(secure_path)) || secure_path.empty()) {
+      // secure_file_priv is a GLOBAL variable, the session level value may be
+      // empty, fall back to the global one.
+      ret = OB_SUCCESS;
+      secure_path.reset();
+      if (OB_FAIL(ObBasicSessionInfo::get_global_sys_variable(
+                    session_info_, *allocator_,
+                    ObString::make_string("secure_file_priv"), global_val))) {
+      } else if (OB_FAIL(global_val.get_string(secure_path))) {
+      }
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(check_file_path_in_priv(secure_path, table_def->file_path_))) {
     }
   }
 

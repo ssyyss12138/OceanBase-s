@@ -30,6 +30,7 @@
 #include "sql/optimizer/ob_log_expr_values.h"
 #include "sql/optimizer/ob_log_function_table.h"
 #include "sql/optimizer/ob_log_json_table.h"
+#include "sql/optimizer/ob_log_file_table.h"
 #include "sql/optimizer/ob_log_values.h"
 #include "sql/optimizer/ob_log_subplan_filter.h"
 #include "sql/optimizer/ob_log_subplan_scan.h"
@@ -96,6 +97,7 @@
 #include "sql/engine/basic/ob_select_into_op.h"
 #include "sql/engine/basic/ob_function_table_op.h"
 #include "sql/engine/basic/ob_json_table_op.h"
+#include "sql/engine/basic/ob_file_table_op.h"
 #include "sql/engine/dml/ob_table_insert_op.h"
 #include "sql/engine/basic/ob_stat_collector_op.h"
 #include "sql/engine/opt_statistics/ob_optimizer_stats_gathering_op.h"
@@ -5532,6 +5534,38 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
   return ret;
 }
 
+int ObStaticEngineCG::generate_spec(ObLogFileTable &op, ObFileTableSpec &spec,
+                                   const bool in_root_job)
+{
+  int ret = OB_SUCCESS;
+  const ObDMLStmt *stmt = op.get_stmt();
+  const TableItem *table_item = NULL;
+  const ObFileTableDef *def = NULL;
+  UNUSED(in_root_job);
+  if (OB_ISNULL(stmt)
+             || OB_ISNULL(table_item = stmt->get_table_item_by_id(op.get_table_id()))
+             || OB_ISNULL(def = table_item->file_table_def_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("failed to get file table definition", K(ret));
+  } else if (OB_FAIL(spec.column_exprs_.init(op.get_access_exprs().count()))) {
+  } else if (OB_FAIL(ob_write_string(phy_plan_->get_allocator(), def->file_path_,
+                                     spec.file_path_))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < op.get_access_exprs().count(); ++i) {
+      ObExpr *rt_expr = NULL;
+      if (OB_FAIL(mark_expr_self_produced(op.get_access_exprs().at(i)))) {
+      } else if (OB_FAIL(generate_rt_expr(*op.get_access_exprs().at(i), rt_expr))) {
+      } else if (OB_FAIL(spec.column_exprs_.push_back(rt_expr))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      spec.format_ = def->func_type_;
+      spec.header_ = def->header_;
+    }
+  }
+  return ret;
+}
+
 int ObStaticEngineCG::generate_spec(ObLogJsonTable &op, ObJsonTableSpec &spec,
     const bool in_root_job)
 {
@@ -6117,6 +6151,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_FUNCTION_TABLE: {
       type = PHY_FUNCTION_TABLE;
+      break;
+    }
+    case log_op_def::LOG_FILE_TABLE: {
+      type = PHY_FILE_TABLE;
       break;
     }
     case log_op_def::LOG_JSON_TABLE: {

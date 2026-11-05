@@ -5963,6 +5963,11 @@ bool oceanbase::sql::Path::is_json_table_path() const
   return NULL != parent_ && parent_->get_type() == JSON_TABLE_ACCESS;
 }
 
+bool oceanbase::sql::Path::is_file_table_path() const
+{
+  return NULL != parent_ && parent_->get_type() == FILE_TABLE_ACCESS;
+}
+
 bool oceanbase::sql::Path::is_temp_table_path() const
 {
   return NULL != parent_ && parent_->get_type() == TEMP_TABLE_ACCESS;
@@ -8333,6 +8338,8 @@ int ObJoinOrder::init_base_join_order(const TableItem *table_item)
       set_type(FUNCTION_TABLE_ACCESS);
     } else if (table_item->is_json_table()) {
       set_type(JSON_TABLE_ACCESS);
+    } else if (table_item->is_file_table()) {
+      set_type(FILE_TABLE_ACCESS);
     } else if (table_item->is_values_table()) {
       set_type(VALUES_TABLE_ACCESS);
     } else if (table_item->is_lateral_table()) {
@@ -8353,6 +8360,8 @@ int ObJoinOrder::generate_base_paths()
     ret = generate_function_table_paths();
   } else if (JSON_TABLE_ACCESS == get_type()) {
     ret = generate_json_table_paths();
+  } else if (FILE_TABLE_ACCESS == get_type()) {
+    ret = generate_file_table_paths();
   } else if (TEMP_TABLE_ACCESS == get_type()) {
     ret = generate_temp_table_paths();
   } else if (ACCESS == get_type()) {
@@ -8461,6 +8470,41 @@ int ObJoinOrder::generate_json_table_paths()
     } else if (OB_FAIL(add_path(json_path))) {
     } else { /*do nothing*/ }
   }
+  return ret;
+}
+
+int ObJoinOrder::generate_file_table_paths()
+{
+  int ret = OB_SUCCESS;
+  FileTablePath *file_path = NULL;
+  const ObDMLStmt *stmt = NULL;
+  if (OB_ISNULL(get_plan()) || OB_ISNULL(stmt = get_plan()->get_stmt())
+      || OB_ISNULL(allocator_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(stmt->get_table_item_by_id(table_id_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(file_path = static_cast<FileTablePath *>(
+                         allocator_->alloc(sizeof(FileTablePath))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    file_path = new (file_path) FileTablePath();
+    file_path->table_id_ = table_id_;
+    file_path->parent_ = this;
+    output_rows_ = 1000;
+    output_row_size_ = 100;
+    if (OB_FAIL(file_path->estimate_cost())) {
+    } else if (OB_FAIL(file_path->compute_pipeline_info())) {
+    } else if (OB_FAIL(add_path(file_path))) {
+    }
+  }
+  return ret;
+}
+
+int FileTablePath::estimate_cost()
+{
+  int ret = OB_SUCCESS;
+  cost_ = 10.0;
+  op_cost_ = 0.0;
   return ret;
 }
 

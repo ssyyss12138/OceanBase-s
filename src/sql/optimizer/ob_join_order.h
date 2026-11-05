@@ -392,6 +392,7 @@ class Path
     bool is_cte_path() const;
     bool is_function_table_path() const;
     bool is_json_table_path() const;
+    bool is_file_table_path() const;
     bool is_temp_table_path() const;
     bool is_access_path() const;
     bool is_join_path() const;
@@ -1176,6 +1177,28 @@ class Path
     common::ObSEArray<ObColumnDefault, 1, common::ModulePageAllocator, true> column_param_default_exprs_;
   private:
       DISALLOW_COPY_AND_ASSIGN(JsonTablePath);
+  };
+
+  class FileTablePath : public Path
+  {
+  public:
+    FileTablePath()
+      : Path(NULL),
+        table_id_(OB_INVALID_ID) {}
+    virtual ~FileTablePath() {}
+    virtual int estimate_cost() override;
+    virtual int get_name_internal(char *buf, const int64_t buf_len, int64_t &pos) const
+    {
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(BUF_PRINTF("@file_table_"))) {
+      } else if (OB_FAIL(BUF_PRINTF("%lu", table_id_))) {
+      }
+      return ret;
+    }
+  public:
+    uint64_t table_id_;
+  private:
+    DISALLOW_COPY_AND_ASSIGN(FileTablePath);
   };
 
   class TempTablePath : public Path
@@ -2043,6 +2066,7 @@ struct NullAwareAntiJoinInfo {
     int generate_cte_table_paths();
     int generate_function_table_paths();
     int generate_json_table_paths();
+    int generate_file_table_paths();
     int generate_values_table_paths();
     int generate_temp_table_paths();
 

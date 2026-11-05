@@ -29,6 +29,7 @@
 #include "ob_log_expr_values.h"
 #include "ob_log_function_table.h"
 #include "ob_log_json_table.h"
+#include "ob_log_file_table.h"
 #include "ob_log_values.h"
 #include "ob_log_material.h"
 #include "ob_log_window_function.h"
@@ -241,6 +242,13 @@ ObLogicalOperator *ObLogOperatorFactory::allocate(ObLogPlan &plan, ObLogOpType t
     ptr = allocator_.alloc(sizeof(ObLogFunctionTable));
     if (NULL != ptr) {
       ret_op = new (ptr) ObLogFunctionTable(plan);
+    } else { /* do nothing */ }
+    break;
+  }
+  case LOG_FILE_TABLE: {
+    ptr = allocator_.alloc(sizeof(ObLogFileTable));
+    if (NULL != ptr) {
+      ret_op = new (ptr) ObLogFileTable(plan);
     } else { /* do nothing */ }
     break;
   }

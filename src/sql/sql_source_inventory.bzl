@@ -2,6 +2,69 @@
 
 SQL_UNITY_GROUPS = [
     struct(
+        name = "ob_sql_file_sql_log_op",
+        language = "c++",
+        srcs = [
+            "src/sql/optimizer/ob_log_file_table.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
+        name = "ob_sql_file_sql_op",
+        language = "c++",
+        srcs = [
+            "src/sql/engine/basic/ob_file_table_op.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
+        name = "ob_sql_file_sql_csv",
+        language = "c++",
+        srcs = [
+            "src/sql/engine/basic/ob_file_csv_reader.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
+        name = "ob_sql_file_sql_jsonl",
+        language = "c++",
+        srcs = [
+            "src/sql/engine/basic/ob_file_jsonl_reader.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
+        name = "ob_sql_file_sql_parquet",
+        language = "c++",
+        srcs = [
+            "src/sql/engine/basic/ob_file_parquet_reader.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
+        name = "ob_sql_file_sql_copy",
+        language = "c++",
+        srcs = [
+            "src/sql/engine/basic/ob_file_copy_writer.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
+        name = "ob_sql_file_sql_resolver",
+        language = "c++",
+        srcs = [
+            "src/sql/resolver/dml/ob_file_table_resolver.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
         name = "ob_sql_code_generator_0",
         language = "c++",
         srcs = [
