@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_explain_resolver.h"
+#include <strings.h>
 #include "sql/resolver/ob_resolver.h"
 
 using namespace oceanbase;
@@ -64,7 +65,26 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
         LOG_WARN("failed to generate stmt for child stmt");
       } else {
         explain_stmt->set_explain_query_stmt(static_cast<ObDMLStmt *>(child_stmt));
-        explain_stmt->set_describe_query(0 != parse_tree.value_
+        bool is_describe_stmt = false;
+        ObExecContext *exec_ctx = (NULL == params_.session_info_) ? NULL
+                                                       : params_.session_info_->get_cur_exec_ctx();
+        const ObSqlCtx *sql_ctx = (NULL == exec_ctx) ? NULL : exec_ctx->get_sql_ctx();
+        if (NULL != sql_ctx) {
+          const ObString &cur_sql = sql_ctx->cur_sql_;
+          int64_t pos = 0;
+          while (pos < cur_sql.length()
+                 && (32 == cur_sql.ptr()[pos] || 9 == cur_sql.ptr()[pos]
+                     || 10 == cur_sql.ptr()[pos])) {
+            ++pos;
+          }
+          const int64_t left = cur_sql.length() - pos;
+          if (left > 9 && 0 == strncasecmp(cur_sql.ptr() + pos, "describe ", 9)) {
+            is_describe_stmt = true;
+          } else if (left > 5 && 0 == strncasecmp(cur_sql.ptr() + pos, "desc ", 5)) {
+            is_describe_stmt = true;
+          }
+        }
+        explain_stmt->set_describe_query(is_describe_stmt
                                          && T_SELECT == child_node->type_);
         ParseNode *format = parse_tree.children_[EXPLAIN_FORMAT];
         if (NULL != format) {
