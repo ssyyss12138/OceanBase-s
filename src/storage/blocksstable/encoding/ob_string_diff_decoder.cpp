@@ -25,6 +25,34 @@ namespace oceanbase
 namespace blocksstable
 {
 using namespace common;
+namespace
+{
+// Difference descriptors often contain only a few bytes (e.g. document IDs).
+// Constant-size copies stay inline without unaligned loads or reading beyond
+// a descriptor; longer strings retain the normal library implementation.
+struct StringDiffCopy
+{
+  void operator()(const void *source, void *destination, const int64_t n) const
+  {
+    const char *src = static_cast<const char *>(source);
+    char *dst = static_cast<char *>(destination);
+    if (n > 16) {
+      MEMCPY(dst, src, n);
+    } else if (n >= 8) {
+      MEMCPY(dst, src, 8);
+      MEMCPY(dst + n - 8, src + n - 8, 8);
+    } else if (n >= 4) {
+      MEMCPY(dst, src, 4);
+      MEMCPY(dst + n - 4, src + n - 4, 4);
+    } else if (n >= 2) {
+      MEMCPY(dst, src, 2);
+      MEMCPY(dst + n - 2, src + n - 2, 2);
+    } else if (n == 1) {
+      *dst = *src;
+    }
+  }
+};
+} // namespace
 const ObColumnHeader::Type ObStringDiffDecoder::type_;
 
 ObStringDiffDecoder::ObStringDiffDecoder() : header_(NULL)
@@ -89,7 +117,7 @@ int ObStringDiffDecoder::decode(const ObColumnDecoderCtx &ctx, common::ObDatum &
       if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(buf_size)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
-        header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
+        header_->copy_string(StringDiffCopy(), std::logical_not<uint8_t>(),
             header_->common_data(), buf);
       }
     }
@@ -103,7 +131,7 @@ int ObStringDiffDecoder::decode(const ObColumnDecoderCtx &ctx, common::ObDatum &
             static_cast<void (ObHexStringUnpacker::*)(unsigned char &)>(&ObHexStringUnpacker::unpack),
             reinterpret_cast<unsigned char *>(buf));
       } else {
-        header_->copy_string(ObStringDiffHeader::LeftToRight(),
+        header_->copy_string(StringDiffCopy(),
             ObStringDiffHeader::LogicTrue<uint8_t>(),
             cell_data, buf);
       }
@@ -167,7 +195,7 @@ int ObStringDiffDecoder::batch_decode(
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       for (int64_t i = 0; i < row_cap; ++i) {
-        header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
+        header_->copy_string(StringDiffCopy(), std::logical_not<uint8_t>(),
             header_->common_data(), buf + i * buf_size);
       }
     }
@@ -192,7 +220,7 @@ int ObStringDiffDecoder::batch_decode(
                 reinterpret_cast<unsigned char *>(str_ptr));
           } else {
             header_->copy_string(
-              ObStringDiffHeader::LeftToRight(),
+              StringDiffCopy(),
               ObStringDiffHeader::LogicTrue<uint8_t>(),
               cell_data, str_ptr);
           }
@@ -224,7 +252,7 @@ int ObStringDiffDecoder::batch_decode(
                 reinterpret_cast<unsigned char *>(str_ptr));
           } else {
             header_->copy_string(
-              ObStringDiffHeader::LeftToRight(),
+              StringDiffCopy(),
               ObStringDiffHeader::LogicTrue<uint8_t>(),
               cell_data, str_ptr);
           }
