@@ -435,6 +435,13 @@ int glob_files(const std::string &pattern, std::vector<std::string> &files)
     if (0 == ::strcmp(name, ".") || 0 == ::strcmp(name, "..")) {
       continue;
     }
+    // Match ordinary shell glob semantics: '*' does not discover hidden
+    // directory entries unless the filename pattern explicitly starts with
+    // '.'. This also prevents macOS AppleDouble sidecars (._*) from being
+    // exposed as user data files after fixture deployment.
+    if ('.' == name[0] && (name_pattern.empty() || '.' != name_pattern[0])) {
+      continue;
+    }
     if (!wildcard_match(name_pattern, name)) {
       continue;
     }
