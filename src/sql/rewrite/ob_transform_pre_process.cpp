@@ -32,6 +32,41 @@ namespace oceanbase
 using namespace common;
 namespace sql
 {
+// A scalar COUNT(*) observes only the cardinality of this limited view.
+// Its MATCH ordering cannot change that cardinality, so avoid relevance
+// ranking when no outer predicate or projection can observe the chosen rows.
+static bool can_remove_counted_fts_order(const ObSelectStmt &outer, const ObSelectStmt &view)
+{
+  bool can_remove = outer.is_scala_group_by()
+      && outer.get_aggr_item_size() == 1 && outer.get_select_item_size() == 1
+      && outer.is_single_table_stmt() && outer.get_condition_size() == 0
+      && !outer.has_having() && !outer.has_window_function()
+      && !outer.has_for_update() && !outer.has_select_into()
+      && !outer.is_contains_assignment() && outer.get_subquery_expr_size() == 0
+      && view.has_limit() && !view.is_fetch_with_ties()
+      && view.get_limit_percent_expr() == nullptr
+      && view.is_single_table_stmt() && view.get_table_item(0) != nullptr
+      && view.get_table_item(0)->is_basic_table()
+      && !view.has_group_by() && !view.has_distinct() && !view.has_window_function()
+      && !view.has_for_update() && !view.has_select_into()
+      && !view.is_contains_assignment() && view.get_subquery_expr_size() == 0
+      && view.get_order_item_size() == 1
+      && view.get_order_item(0).expr_ != nullptr
+      && view.get_order_item(0).expr_->get_expr_type() == T_FUN_MATCH_AGAINST;
+  if (can_remove) {
+    const ObAggFunRawExpr *count = outer.get_aggr_item(0);
+    can_remove = count != nullptr && count->get_expr_type() == T_FUN_COUNT
+        && count->get_real_param_count() == 0 && !count->is_param_distinct()
+        && outer.get_select_item(0).expr_ == count;
+  }
+  for (int64_t i = 0; can_remove && i < view.get_select_item_size(); ++i) {
+    const ObRawExpr *expr = view.get_select_item(i).expr_;
+    // Preserve evaluation/order for functions, assignments and sequences.
+    can_remove = expr != nullptr && (expr->is_column_ref_expr() || expr->is_const_expr());
+  }
+  return can_remove;
+}
+
 int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> &parent_stmts,
                                               ObDMLStmt *&stmt,
                                               bool &trans_happened)
@@ -182,6 +217,28 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
           OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
       } else {
         trans_happened |= is_happened;
+      }
+    }
+    // General rewrite rules are disabled for full-text statements. Prune
+    // this unobservable ranking here, after child preprocessing added it.
+    if (OB_SUCC(ret) && stmt->is_select_stmt()) {
+      auto *outer = static_cast<ObSelectStmt *>(stmt);
+      TableItem *view = outer->get_table_items().count() == 1 ? outer->get_table_item(0) : nullptr;
+      if (view != nullptr && view->is_generated_table() && view->ref_query_ != nullptr
+          && can_remove_counted_fts_order(*outer, *view->ref_query_)) {
+        ObConstRawExpr *one = nullptr;
+        if (OB_ISNULL(ctx_->expr_factory_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*ctx_->expr_factory_, ObIntType, 1, one))) {
+        } else {
+          view->ref_query_->get_order_items().reset();
+          // COUNT(*) does not consume these plain column/constant outputs.
+          // Removing them also avoids rowkey lookup solely for projection.
+          for (int64_t i = 0; i < view->ref_query_->get_select_item_size(); ++i) {
+            view->ref_query_->get_select_item(i).expr_ = one;
+          }
+          trans_happened = true;
+        }
       }
     }
     if (OB_SUCC(ret) && OB_FAIL(reset_view_base(stmt))) {

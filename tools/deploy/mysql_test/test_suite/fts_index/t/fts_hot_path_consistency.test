@@ -35,6 +35,33 @@ INSERT INTO docs SELECT id+512,body FROM docs;
 SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta');
 SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha gamma');
 SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 7 OFFSET 3) t;
+# Removing relevance ordering is safe only when the outer query observes
+# cardinality. LIMIT/OFFSET, empty matches and prepared binds keep semantics.
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 0) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 20 OFFSET 10000) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('absenttoken') LIMIT 20) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') > 0.2 LIMIT 20 OFFSET 3) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('+alpha -beta' IN BOOLEAN MODE) LIMIT 20) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') AND MOD(id,17)=0 LIMIT 7) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') AND MOD(id,17)=0 LIMIT 7 OFFSET 9) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') AND id<0 LIMIT 7) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') ORDER BY MATCH(body) AGAINST('alpha beta') DESC LIMIT 20) t;
+# Numeric and nullable projections, outer filters and other aggregates still
+# observe which rows were selected and must preserve the ranking path.
+SELECT COUNT(*),SUM(id) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') ORDER BY MATCH(body) AGAINST('alpha beta') DESC,id LIMIT 20) t;
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') ORDER BY MATCH(body) AGAINST('alpha beta') DESC,id LIMIT 20) t WHERE MOD(id,3)=0;
+SELECT COUNT(x) FROM (SELECT NULL AS x FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 20) t;
+SELECT ROUND(SUM(score),8) FROM (SELECT MATCH(body) AGAINST('alpha beta') AS score FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 20) t;
+PREPARE counted_limit FROM 'SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST(?) LIMIT ? OFFSET ?) t';
+SET @term='alpha beta',@lim=7,@off=3;
+EXECUTE counted_limit USING @term,@lim,@off;
+SET @lim=0;
+EXECUTE counted_limit USING @term,@lim,@off;
+SET @lim=2000,@off=0;
+EXECUTE counted_limit USING @term,@lim,@off;
+SET @term='absenttoken';
+EXECUTE counted_limit USING @term,@lim,@off;
+DEALLOCATE PREPARE counted_limit;
 SELECT COUNT(*),SUM(CASE WHEN MATCH(body) AGAINST('alpha beta') THEN 1 ELSE 0 END)
  FROM docs WHERE MATCH(body) AGAINST('alpha beta');
 SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('alpha beta') > 0.2;
