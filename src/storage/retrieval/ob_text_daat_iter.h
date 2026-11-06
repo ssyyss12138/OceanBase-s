@@ -73,6 +73,7 @@ private:
   struct UnionCursor
   {
     const ObDocIdExt *ids_ = nullptr;
+    const ObDatum *head_ = nullptr;
     int64_t size_ = 0;
     int64_t pos_ = 0;
     bool ended_ = false;

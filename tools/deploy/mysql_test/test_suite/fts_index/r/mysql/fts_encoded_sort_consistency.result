@@ -1,0 +1,9 @@
+# case-insensitive ascending keys
+mismatches
+0
+# numeric and text keys in mixed directions
+mismatches
+0
+# binary collation and zero bytes
+mismatches
+0

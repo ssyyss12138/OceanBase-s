@@ -96,6 +96,17 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
     const int64_t dim_count = dim_iters_->count();
     auto *const *iters = &dim_iters_->at(0);
     const int64_t output_capacity = MIN(capacity, iter_param_->max_batch_size_);
+    const ObExpr *filter = iter_param_->filter_expr_;
+    const ObExpr *score = iter_param_->relevance_proj_expr_;
+    const bool any_match = relevance_collector_->accepts_any_match()
+        && (nullptr == filter || (nullptr != score && T_OP_BOOL == filter->type_
+            && 1 == filter->arg_cnt_ && filter->args_[0] == score
+            && (common::ObDoubleType == score->datum_meta_.type_
+                || common::ObUDoubleType == score->datum_meta_.type_)))
+        && output_capacity <= iter_param_->eval_ctx_->max_batch_size_;
+    ObDocIdExt *output_ids = &buffered_domain_ids_.at(0);
+    double *output_scores = &buffered_relevances_.at(0);
+    const auto *limit = iter_param_->limit_param_;
     while (OB_SUCC(ret) && count < output_capacity) {
       int64_t minimum = -1;
       uint64_t equal_dims = 0;
@@ -110,12 +121,15 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
             }
           }
           cursor.pos_ = 0;
+          if (OB_SUCC(ret) && !cursor.ended_) {
+            cursor.head_ = &cursor.ids_[0].get_datum();
+          }
         }
         if (OB_SUCC(ret) && !cursor.ended_) {
           // Only binary document IDs enter this path. Their stored bytes have
           // the same order as the original null-safe binary comparator.
-          const int cmp = minimum < 0 ? -1 : cursor.ids_[cursor.pos_].get_datum().get_string().compare(
-              union_cursors_[minimum].ids_[union_cursors_[minimum].pos_].get_datum().get_string());
+          const int cmp = minimum < 0 ? -1 : cursor.head_->get_string().compare(
+              union_cursors_[minimum].head_->get_string());
           if (cmp < 0) {
             minimum = i;
             equal_dims = uint64_t{1} << i;
@@ -127,6 +141,21 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
       if (OB_FAIL(ret)) {
       } else if (minimum < 0) {
         ret = OB_ITER_END;
+      } else if (any_match) {
+        // This is a score-free natural union with an any-term predicate.
+        // Membership is already established by the merge; batch projection
+        // below needs only a positive truth value, not per-term score updates.
+        ++input_row_cnt_;
+        if (!limit->is_valid() || input_row_cnt_ > limit->offset_) {
+          if (OB_FAIL(output_ids[count].from_datum(*union_cursors_[minimum].head_))) {
+          } else {
+            output_scores[count++] = 1.0;
+            ++output_row_cnt_;
+            if (limit->is_valid() && output_row_cnt_ >= limit->limit_) {
+              ret = OB_ITER_END;
+            }
+          }
+        }
       } else {
         double relevance = 0.0;
         bool valid = false;
@@ -142,12 +171,15 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
         } else if (OB_SUCC(ret) && valid) {
           const UnionCursor &cursor = union_cursors_[minimum];
           // Copy to the owned output before any cursor can refill its buffer.
-          ret = cache_result(count, cursor.ids_[cursor.pos_].get_datum(), relevance);
+          ret = cache_result(count, *cursor.head_, relevance);
         }
-        for (int64_t i = 0; i < dim_count; ++i) {
-          if ((equal_dims & (uint64_t{1} << i)) != 0) {
-            ++union_cursors_[i].pos_;
-          }
+      }
+      for (int64_t i = 0; i < dim_count; ++i) {
+        if ((equal_dims & (uint64_t{1} << i)) != 0) {
+          UnionCursor &cursor = union_cursors_[i];
+          ++cursor.pos_;
+          cursor.head_ = cursor.pos_ < cursor.size_
+              ? &cursor.ids_[cursor.pos_].get_datum() : nullptr;
         }
       }
     }

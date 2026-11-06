@@ -524,14 +524,14 @@ public:
     unsigned char *key_ptr_;
     ObChunkDatumStore::StoredRow *row_ptr_;
     uint32_t len_;
-    unsigned char sub_cache_[2];
+    uint64_t prefix_;
     AQSItem() : key_ptr_(NULL),
                 row_ptr_(NULL),
                 len_(0),
-                sub_cache_()
+                prefix_(0)
     {
     }
-    TO_STRING_KV(K_(len), K_(sub_cache), K_(key_ptr), KP(row_ptr_));
+    TO_STRING_KV(K_(len), K_(prefix), K_(key_ptr), KP(row_ptr_));
   };
   class ObAdaptiveQS {
     public:
@@ -543,7 +543,7 @@ public:
       }
       void sort(int64_t rows_begin, int64_t rows_end)
       {
-        aqs_cps_qs(0, sort_rows_.count(), 0, 0, 0);
+        sort_encoded_range(0, sort_rows_.count(), 0);
         for (int64_t i = 0; i < sort_rows_.count() && i < (rows_end - rows_begin); ++i) {
           orig_sort_rows_.at(i + rows_begin) = sort_rows_.at(i).row_ptr_;
         }
@@ -552,28 +552,8 @@ public:
       {
         sort_rows_.reset();
       }
-      void aqs_cps_qs(int64_t l, int64_t r, int64_t common_prefix,
-                        int64_t depth_limit, int64_t cache_offset);
-      void aqs_radix(int64_t l, int64_t r, int64_t common_prefix,
-                        int64_t offset, int64_t depth_limit);
-      void inplace_radixsort_more_bucket(int64_t l, int64_t r,
-                                          int64_t div_val,
-                                          int64_t common_prefix,
-                                          int64_t depth_limit,
-                                          int64_t cache_offset,
-                                          bool update);
-      void insertion_sort(int64_t l, int64_t r,
-                            int64_t common_prefix,
-                            int64_t cache_offset);
-      inline void swap(int64_t l, int64_t r) {
-        std::swap(sort_rows_[r], sort_rows_[l]);
-      }
-      inline int compare_vals(int64_t l, int64_t r, int64_t &differ_at,
-                              int64_t common_prefix, int64_t cache_offset);
-      inline int compare_cache(AQSItem &l, AQSItem &r, int64_t &differ_at,
-                                int64_t common_prefix, int64_t cache_offset);
+      void sort_encoded_range(int64_t l, int64_t r, int64_t common_prefix);
     public:
-      unsigned char masks[8]{0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
       common::ObIArray<ObChunkDatumStore::StoredRow *> &orig_sort_rows_;
       common::ObFixedArray<AQSItem, common::ObIAllocator> sort_rows_;
       common::ObIAllocator &alloc_;

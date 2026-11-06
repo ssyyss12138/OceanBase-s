@@ -1,0 +1,51 @@
+# Compare the encoded-key sorter with the original SQL comparator. Vary key
+# lengths, long shared prefixes, NULLs, collation, direction and secondary keys.
+--disable_query_log
+--disable_warnings
+DROP DATABASE IF EXISTS fts_encoded_sort_consistency;
+--enable_warnings
+CREATE DATABASE fts_encoded_sort_consistency;
+USE fts_encoded_sort_consistency;
+CREATE TABLE t(id INT PRIMARY KEY, s CHAR(128) COLLATE utf8mb4_general_ci,
+               b CHAR(128) COLLATE utf8mb4_bin, n BIGINT, d DOUBLE);
+INSERT INTO t(id) VALUES(0),(1),(2),(3),(4),(5),(6),(7);
+INSERT INTO t(id) SELECT id+8 FROM t;
+INSERT INTO t(id) SELECT id+16 FROM t;
+INSERT INTO t(id) SELECT id+32 FROM t;
+INSERT INTO t(id) SELECT id+64 FROM t;
+INSERT INTO t(id) SELECT id+128 FROM t;
+INSERT INTO t(id) SELECT id+256 FROM t;
+INSERT INTO t(id) SELECT id+512 FROM t;
+INSERT INTO t(id) SELECT id+1024 FROM t;
+INSERT INTO t(id) SELECT id+2048 FROM t;
+UPDATE t SET s=CASE WHEN MOD(id,17)=0 THEN NULL ELSE
+ CONCAT(REPEAT(CHAR(97+MOD(id,20)),MOD(id,120)),
+ CASE MOD(id,4) WHEN 0 THEN '数据库' WHEN 1 THEN 'École' WHEN 2 THEN '😀' ELSE CHAR(0) END) END,
+ n=CASE WHEN MOD(id,11)=0 THEN NULL ELSE MOD(id*7919,65536)-32768 END,
+ d=CASE WHEN MOD(id,7)=0 THEN NULL ELSE (MOD(id*3571,10000)-5000)/7.0 END;
+UPDATE t SET b=s;
+
+CREATE TABLE original_order AS SELECT /*+ opt_param('enable_newsort','false') */
+ id,ROW_NUMBER() OVER(ORDER BY s ASC,id DESC) rnk FROM t;
+CREATE TABLE encoded_order AS SELECT /*+ opt_param('enable_newsort','true') */
+ id,ROW_NUMBER() OVER(ORDER BY s ASC,id DESC) rnk FROM t;
+--echo # case-insensitive ascending keys
+SELECT COUNT(*) AS mismatches FROM original_order o JOIN encoded_order e ON o.rnk=e.rnk WHERE o.id<>e.id;
+DROP TABLE original_order,encoded_order;
+
+CREATE TABLE original_order AS SELECT /*+ opt_param('enable_newsort','false') */
+ id,ROW_NUMBER() OVER(ORDER BY n DESC,d ASC,s DESC,id) rnk FROM t;
+CREATE TABLE encoded_order AS SELECT /*+ opt_param('enable_newsort','true') */
+ id,ROW_NUMBER() OVER(ORDER BY n DESC,d ASC,s DESC,id) rnk FROM t;
+--echo # numeric and text keys in mixed directions
+SELECT COUNT(*) AS mismatches FROM original_order o JOIN encoded_order e ON o.rnk=e.rnk WHERE o.id<>e.id;
+DROP TABLE original_order,encoded_order;
+
+CREATE TABLE original_order AS SELECT /*+ opt_param('enable_newsort','false') */
+ id,ROW_NUMBER() OVER(ORDER BY b DESC,id) rnk FROM t;
+CREATE TABLE encoded_order AS SELECT /*+ opt_param('enable_newsort','true') */
+ id,ROW_NUMBER() OVER(ORDER BY b DESC,id) rnk FROM t;
+--echo # binary collation and zero bytes
+SELECT COUNT(*) AS mismatches FROM original_order o JOIN encoded_order e ON o.rnk=e.rnk WHERE o.id<>e.id;
+DROP DATABASE fts_encoded_sort_consistency;
+--enable_query_log
