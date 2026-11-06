@@ -203,6 +203,60 @@ int flatten_file_table_args(const ParseNode *node, ObIArray<const ParseNode *> &
   return ret;
 }
 
+
+// Extracts an integer literal from a parse node, covering the shapes the MySQL
+// parser may produce for a literal (parameter marker / number / unary minus).
+bool get_int_literal(const ParseNode *node, int64_t &value)
+{
+  bool found = false;
+  if (NULL == node) {
+    found = false;
+  } else if (T_NUMBER == node->type_ || T_INT == node->type_
+             || T_UNUMBER == node->type_) {
+    value = node->value_;
+    found = true;
+  } else if (T_OP_NEG == node->type_ && 1 == node->num_child_
+             && NULL != node->children_[0]) {
+    int64_t inner = 0;
+    if (get_int_literal(node->children_[0], inner)) {
+      value = -inner;
+      found = true;
+    }
+  } else if (NULL != node->str_value_ && node->str_len_ > 0) {
+    char buf[64];
+    int64_t len = node->str_len_ < (int64_t)sizeof(buf) - 1
+                      ? node->str_len_ : (int64_t)sizeof(buf) - 1;
+    MEMCPY(buf, node->str_value_, len);
+    buf[len] = '\0';
+    char *end = NULL;
+    const long long v = ::strtoll(buf, &end, 10);
+    if (NULL != end && '\0' == *end) {
+      value = static_cast<int64_t>(v);
+      found = true;
+    }
+  }
+  return found;
+}
+
+// Extracts a boolean literal, tolerating parameter markers carrying text.
+bool get_bool_literal_ext(const ParseNode *node, bool &value)
+{
+  bool found = get_bool_literal(node, value);
+  if (!found && NULL != node && NULL != node->str_value_ && node->str_len_ > 0) {
+    const int32_t len = static_cast<int32_t>(node->str_len_);
+    if ((4 == len && 0 == strncasecmp(node->str_value_, "true", 4))
+        || (1 == len && '1' == node->str_value_[0])) {
+      value = true;
+      found = true;
+    } else if ((5 == len && 0 == strncasecmp(node->str_value_, "false", 5))
+               || (1 == len && '0' == node->str_value_[0])) {
+      value = false;
+      found = true;
+    }
+  }
+  return found;
+}
+
 // Canonicalizes both paths and verifies that the file lives inside
 // secure_file_priv. Returns OB_ERR_NO_PRIVILEGE when it escapes.
 int check_file_path_in_priv(const ObString &priv, const ObString &path)
@@ -338,26 +392,13 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
         ret = OB_ERR_PARSER_SYNTAX;
         LOG_WARN("expected a named argument like name = value", K(ret), K(i));
       } else if (0 == arg_name.case_compare("header")) {
-        if (!get_bool_literal(value_node, table_def->header_)) {
+        if (!get_bool_literal_ext(value_node, table_def->header_)) {
           ret = OB_ERR_PARSER_SYNTAX;
         }
       } else if (0 == arg_name.case_compare("sample_size")) {
         // Only a full file scan is supported by design.
-        bool is_all = false;
-        if (NULL != value_node && T_NUMBER == value_node->type_ && -1 == value_node->value_) {
-          is_all = true;
-        } else if (NULL != value_node && T_QUESTIONMARK == value_node->type_
-                   && NULL != value_node->str_value_ && value_node->str_len_ > 0
-                   && '-' == value_node->str_value_[0]
-                   && 2 == value_node->str_len_ && '1' == value_node->str_value_[1]) {
-          is_all = true;
-        } else if (NULL != value_node && T_OP_NEG == value_node->type_
-                   && 1 == value_node->num_child_ && NULL != value_node->children_[0]
-                   && T_NUMBER == value_node->children_[0]->type_
-                   && 1 == value_node->children_[0]->value_) {
-          is_all = true;
-        }
-        if (!is_all) {
+        int64_t sample_value = 0;
+        if (!get_int_literal(value_node, sample_value) || -1 != sample_value) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("only sample_size = -1 is supported", K(ret));
         }
@@ -377,6 +418,26 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
       } else if (0 == arg_name.case_compare("delimiter")) {
         ObString value;
         if (!get_string_literal(value_node, value) || 1 != value.length()) {
+          ret = OB_ERR_PARSER_SYNTAX;
+        } else {
+          table_def->delimiter_ = value[0];
+        }
+      } else if (0 == arg_name.case_compare("quote")) {
+        ObString value;
+        if (!get_string_literal(value_node, value) || 1 != value.length()) {
+          ret = OB_ERR_PARSER_SYNTAX;
+        } else {
+          table_def->quote_ = value[0];
+        }
+      } else if (0 == arg_name.case_compare("escape")) {
+        ObString value;
+        if (!get_string_literal(value_node, value) || 1 != value.length()) {
+          ret = OB_ERR_PARSER_SYNTAX;
+        } else {
+          table_def->escape_ = value[0];
+        }
+      } else if (0 == arg_name.case_compare("nullstr")) {
+        if (!get_string_literal(value_node, table_def->null_str_)) {
           ret = OB_ERR_PARSER_SYNTAX;
         }
       } else {
@@ -469,6 +530,12 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
     }
     options.header_ = table_def->header_;
     options.sample_size_ = table_def->sample_size_;
+    options.delimiter_ = table_def->delimiter_;
+    options.quote_ = table_def->quote_;
+    options.escape_ = table_def->escape_;
+    if (!table_def->null_str_.empty()) {
+      options.null_str_.assign(table_def->null_str_.ptr(), table_def->null_str_.length());
+    }
     std::string path(table_def->file_path_.ptr(), table_def->file_path_.length());
     std::unique_ptr<file_sql::FileFormatReader> reader;
     std::vector<file_sql::FileColumnSchema> schema;

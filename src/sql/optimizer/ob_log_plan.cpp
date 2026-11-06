@@ -6841,10 +6841,19 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
   } else {
     ObSelectIntoItem *into_item = stmt->get_select_into();
     ObSEArray<ObRawExpr*, 4> select_exprs;
+    ObSEArray<ObString, 4> column_names;
     if (OB_ISNULL(into_item)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(stmt->get_select_exprs(select_exprs))) {
     } else if (OB_FAIL(select_into->get_select_exprs().assign(select_exprs))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_select_item_size(); ++i) {
+      const SelectItem &item = stmt->get_select_item(i);
+      const ObString &column_name = item.alias_name_.empty() ? item.expr_name_ : item.alias_name_;
+      if (OB_FAIL(column_names.push_back(column_name))) {
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(select_into->set_column_names(column_names))) {
     }
     if (OB_SUCC(ret)) {
       select_into->set_into_type(into_item->into_type_);
@@ -6859,6 +6868,7 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_buffer_size(into_item->buffer_size_);
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
+      select_into->set_is_file_copy(into_item->is_file_copy_);
       select_into->set_external_properties(into_item->external_properties_);
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       // compute property

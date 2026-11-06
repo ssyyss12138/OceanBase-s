@@ -28,7 +28,7 @@ namespace sql
 {
 
 OB_SERIALIZE_MEMBER((ObFileTableSpec, ObOpSpec), column_exprs_, column_idxs_,
-                    file_path_, format_, header_);
+                    file_path_, format_, header_, delimiter_, quote_, escape_, null_str_);
 
 namespace
 {
@@ -87,6 +87,12 @@ int ObFileTableOp::open_reader()
   file_sql::FileReadOptions options;
   options.format_ = static_cast<file_sql::FileFormat>(spec.format_);
   options.header_ = spec.header_;
+  options.delimiter_ = spec.delimiter_;
+  options.quote_ = spec.quote_;
+  options.escape_ = spec.escape_;
+  if (!spec.null_str_.empty()) {
+    options.null_str_.assign(spec.null_str_.ptr(), spec.null_str_.length());
+  }
   std::string path(spec.file_path_.ptr(), spec.file_path_.length());
   if (0 != (reader_ret = file_sql::create_file_reader(path, options, reader_))
       || nullptr == reader_.get()) {

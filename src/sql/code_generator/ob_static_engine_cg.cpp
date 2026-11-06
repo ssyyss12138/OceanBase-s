@@ -5462,6 +5462,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
+  } else if (OB_FAIL(spec.column_names_.init(op.get_column_names().count()))) {
   } else {
     ObString var;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_user_vars().count(); ++i) {
@@ -5479,6 +5480,12 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       } else if (OB_FAIL(spec.select_exprs_.push_back(rt_expr))) {
       }
     }
+    for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_names().count(); ++i) {
+      ObString column_name;
+      if (OB_FAIL(ob_write_string(alloc, op.get_column_names().at(i), column_name))) {
+      } else if (OB_FAIL(spec.column_names_.push_back(column_name))) {
+      }
+    }
     if (OB_SUCC(ret)) {
       spec.into_type_ = op.get_into_type();
       spec.is_optional_ = op.get_is_optional();
@@ -5488,6 +5495,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.cs_type_ = op.get_cs_type();
       spec.parallel_ = op.get_parallel();
       spec.is_overwrite_ = op.get_is_overwrite();
+      spec.is_file_copy_ = op.get_is_file_copy();
       spec.plan_->need_drive_dml_query_ = true;
     }
   }
@@ -5551,6 +5559,8 @@ int ObStaticEngineCG::generate_spec(ObLogFileTable &op, ObFileTableSpec &spec,
              || OB_FAIL(spec.column_idxs_.init(op.get_access_exprs().count()))) {
   } else if (OB_FAIL(ob_write_string(phy_plan_->get_allocator(), def->file_path_,
                                      spec.file_path_))) {
+  } else if (OB_FAIL(ob_write_string(phy_plan_->get_allocator(), def->null_str_,
+                                     spec.null_str_))) {
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_access_exprs().count(); ++i) {
       ObRawExpr *raw_expr = op.get_access_exprs().at(i);
@@ -5589,6 +5599,9 @@ int ObStaticEngineCG::generate_spec(ObLogFileTable &op, ObFileTableSpec &spec,
           break;
       }
       spec.header_ = def->header_;
+      spec.delimiter_ = def->delimiter_;
+      spec.quote_ = def->quote_;
+      spec.escape_ = def->escape_;
     }
   }
   return ret;

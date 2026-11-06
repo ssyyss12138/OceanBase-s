@@ -40,13 +40,21 @@ public:
       column_idxs_(alloc),
       file_path_(),
       format_(0),
-      header_(true) {}
+      header_(true),
+      delimiter_(','),
+      quote_('"'),
+      escape_('"'),
+      null_str_() {}
   // One expression and source-file column index per accessed column.
   common::ObFixedArray<ObExpr *, common::ObIAllocator> column_exprs_;
   common::ObFixedArray<int64_t, common::ObIAllocator> column_idxs_;
   common::ObString file_path_;
   int64_t format_;
   bool header_;
+  char delimiter_;
+  char quote_;
+  char escape_;
+  common::ObString null_str_;
 };
 
 class ObFileTableOp : public ObOperator

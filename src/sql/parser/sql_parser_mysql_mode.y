@@ -373,7 +373,7 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
-%type <node> select_stmt update_stmt delete_stmt
+%type <node> select_stmt copy_stmt copy_source copy_option_list copy_option update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -558,6 +558,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8452,6 +8453,205 @@ select_no_parens opt_when
 | with_select
 {
   $$ = $1;
+}
+;
+
+copy_source:
+select_with_parens
+{
+  $$ = $1;
+}
+| relation_factor
+{
+  ParseNode *star_node = NULL;
+  ParseNode *project = NULL;
+  ParseNode *project_list = NULL;
+  ParseNode *table_node = NULL;
+  ParseNode *from_list = NULL;
+  ParseNode *select_node = NULL;
+
+  malloc_terminal_node(star_node, result->malloc_pool_, T_STAR);
+  malloc_non_terminal_node(project, result->malloc_pool_, T_PROJECT_STRING, 1,
+                           star_node);
+  dup_string_to_node(project, result->malloc_pool_, "*");
+  merge_nodes(project_list, result, T_PROJECT_LIST, project);
+
+  malloc_non_terminal_node(table_node, result->malloc_pool_, T_ORG, 4,
+                           $1, NULL, NULL, NULL);
+  merge_nodes(from_list, result, T_FROM_LIST, table_node);
+
+  malloc_select_node(select_node, result->malloc_pool_);
+  select_node->children_[PARSE_SELECT_SELECT] = project_list;
+  select_node->children_[PARSE_SELECT_FROM] = from_list;
+  $$ = select_node;
+}
+;
+
+copy_stmt:
+COPY copy_source TO STRING_VALUE
+{
+  ParseNode *format_name = NULL;
+  ParseNode *format_type = NULL;
+  ParseNode *delimiter_value = NULL;
+  ParseNode *delimiter_option = NULL;
+  ParseNode *quote_value = NULL;
+  ParseNode *quote_option = NULL;
+  ParseNode *escape_value = NULL;
+  ParseNode *escape_option = NULL;
+  ParseNode *default_options_1 = NULL;
+  ParseNode *default_options_2 = NULL;
+  ParseNode *default_options = NULL;
+  ParseNode *format_list = NULL;
+  ParseNode *into_node = NULL;
+  $$ = $2;
+  make_name_node(format_name, result->malloc_pool_, "csv");
+  malloc_non_terminal_node(format_type, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT_TYPE, 1, format_name);
+  malloc_terminal_node(delimiter_value, result->malloc_pool_, T_VARCHAR);
+  dup_string_to_node(delimiter_value, result->malloc_pool_, ",");
+  malloc_non_terminal_node(delimiter_option, result->malloc_pool_,
+                           T_FIELD_TERMINATED_STR, 1, delimiter_value);
+  malloc_terminal_node(quote_value, result->malloc_pool_, T_VARCHAR);
+  dup_string_to_node(quote_value, result->malloc_pool_, "\"");
+  malloc_non_terminal_node(quote_option, result->malloc_pool_,
+                           T_OPTIONALLY_CLOSED_STR, 1, quote_value);
+  malloc_terminal_node(escape_value, result->malloc_pool_, T_VARCHAR);
+  dup_string_to_node(escape_value, result->malloc_pool_, "\"");
+  malloc_non_terminal_node(escape_option, result->malloc_pool_,
+                           T_ESCAPED_STR, 1, escape_value);
+  malloc_non_terminal_node(default_options_1, result->malloc_pool_,
+                           T_LINK_NODE, 2, format_type, delimiter_option);
+  malloc_non_terminal_node(default_options_2, result->malloc_pool_,
+                           T_LINK_NODE, 2, default_options_1, quote_option);
+  malloc_non_terminal_node(default_options, result->malloc_pool_,
+                           T_LINK_NODE, 2, default_options_2, escape_option);
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, default_options);
+  malloc_non_terminal_node(into_node, result->malloc_pool_,
+                           T_INTO_OUTFILE, 3, $4, format_list, NULL);
+  into_node->value_ = 1;
+  if (NULL == $$ || NULL != $$->children_[PARSE_SELECT_INTO]
+                 || NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY query cannot contain INTO\n");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+  }
+}
+| COPY copy_source TO STRING_VALUE '(' copy_option_list ')'
+{
+  ParseNode *format_name = NULL;
+  ParseNode *format_type = NULL;
+  ParseNode *delimiter_value = NULL;
+  ParseNode *delimiter_option = NULL;
+  ParseNode *quote_value = NULL;
+  ParseNode *quote_option = NULL;
+  ParseNode *escape_value = NULL;
+  ParseNode *escape_option = NULL;
+  ParseNode *default_options_1 = NULL;
+  ParseNode *default_options_2 = NULL;
+  ParseNode *default_options = NULL;
+  ParseNode *all_options = NULL;
+  ParseNode *format_list = NULL;
+  ParseNode *into_node = NULL;
+  $$ = $2;
+  make_name_node(format_name, result->malloc_pool_, "csv");
+  malloc_non_terminal_node(format_type, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT_TYPE, 1, format_name);
+  malloc_terminal_node(delimiter_value, result->malloc_pool_, T_VARCHAR);
+  dup_string_to_node(delimiter_value, result->malloc_pool_, ",");
+  malloc_non_terminal_node(delimiter_option, result->malloc_pool_,
+                           T_FIELD_TERMINATED_STR, 1, delimiter_value);
+  malloc_terminal_node(quote_value, result->malloc_pool_, T_VARCHAR);
+  dup_string_to_node(quote_value, result->malloc_pool_, "\"");
+  malloc_non_terminal_node(quote_option, result->malloc_pool_,
+                           T_OPTIONALLY_CLOSED_STR, 1, quote_value);
+  malloc_terminal_node(escape_value, result->malloc_pool_, T_VARCHAR);
+  dup_string_to_node(escape_value, result->malloc_pool_, "\"");
+  malloc_non_terminal_node(escape_option, result->malloc_pool_,
+                           T_ESCAPED_STR, 1, escape_value);
+  malloc_non_terminal_node(default_options_1, result->malloc_pool_,
+                           T_LINK_NODE, 2, format_type, delimiter_option);
+  malloc_non_terminal_node(default_options_2, result->malloc_pool_,
+                           T_LINK_NODE, 2, default_options_1, quote_option);
+  malloc_non_terminal_node(default_options, result->malloc_pool_,
+                           T_LINK_NODE, 2, default_options_2, escape_option);
+  malloc_non_terminal_node(all_options, result->malloc_pool_,
+                           T_LINK_NODE, 2, default_options, $6);
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, all_options);
+  malloc_non_terminal_node(into_node, result->malloc_pool_,
+                           T_INTO_OUTFILE, 3, $4, format_list, NULL);
+  into_node->value_ = 1;
+  if (NULL == $$ || NULL != $$->children_[PARSE_SELECT_INTO]
+                 || NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY query cannot contain INTO\n");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+  }
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+FORMAT relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+}
+| DELIMITER STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_,
+                           T_FIELD_TERMINATED_STR, 1, $2);
+  dup_expr_string($$, result, @2.first_column, @2.last_column);
+}
+| relation_name
+{
+  ParseNode *enabled = NULL;
+  if (OB_ISNULL($1) || OB_ISNULL($1->str_value_)
+      || 0 != strcasecmp("header", $1->str_value_)) {
+    yyerror(&@1, result, "Unsupported COPY option\n");
+    YYERROR;
+  }
+  malloc_terminal_node(enabled, result->malloc_pool_, T_BOOL);
+  enabled->value_ = 1;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PARSE_HEADER, 1, enabled);
+}
+| relation_name STRING_VALUE
+{
+  if (OB_ISNULL($1) || OB_ISNULL($1->str_value_)) {
+    yyerror(&@1, result, "Invalid COPY option\n");
+    YYERROR;
+  } else if (0 == strcasecmp("delimiter", $1->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_,
+                             T_FIELD_TERMINATED_STR, 1, $2);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else if (0 == strcasecmp("quote", $1->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_,
+                             T_OPTIONALLY_CLOSED_STR, 1, $2);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else if (0 == strcasecmp("escape", $1->str_value_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_ESCAPED_STR, 1, $2);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else if (0 == strcasecmp("nullstr", $1->str_value_)) {
+    ParseNode *values = NULL;
+    malloc_list_node(values, result->malloc_pool_, T_EXPR_LIST, 2, 1, $2);
+    malloc_non_terminal_node($$, result->malloc_pool_,
+                             T_NULL_IF_EXETERNAL, 1, values);
+    dup_expr_string($$, result, @2.first_column, @2.last_column);
+  } else {
+    yyerror(&@1, result, "Unsupported COPY option\n");
+    YYERROR;
+  }
 }
 ;
 

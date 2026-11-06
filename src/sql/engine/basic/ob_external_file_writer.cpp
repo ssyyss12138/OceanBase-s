@@ -29,7 +29,11 @@ namespace sql
 int ObExternalFileWriter::open_file()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(file_appender_.create(url_, true))) {
+  // CSV rows are flushed in variable-sized chunks.  A direct-I/O appender
+  // requires aligned buffers and lengths, so the final short chunk fails with
+  // OB_IO_ERROR and leaves an empty file.  Use the buffered appender for local
+  // file export; close_file() still fsyncs the completed output.
+  if (OB_FAIL(file_appender_.create(url_, false))) {
   } else {
     is_file_opened_ = true;
   }

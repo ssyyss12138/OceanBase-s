@@ -152,15 +152,21 @@ struct ObFileTableDef
   };
   ObFileTableDef()
     : func_type_(READ_CSV), header_(true), sample_size_(-1), format_(),
+      delimiter_(','), quote_('"'), escape_('"'), null_str_(),
       file_path_(), wildcard_(), columns_() {}
   int64_t func_type_;
   bool header_;
   int64_t sample_size_;
   common::ObString format_;
+  char delimiter_;
+  char quote_;
+  char escape_;
+  common::ObString null_str_;
   common::ObString file_path_;
   common::ObString wildcard_;
   common::ObSEArray<ObFileColumnDef, 8, common::ModulePageAllocator, true> columns_;
-  TO_STRING_KV(K_(func_type), K_(file_path), K_(format), K_(columns));
+  TO_STRING_KV(K_(func_type), K_(file_path), K_(format), K_(delimiter),
+               K_(quote), K_(escape), K_(null_str), K_(columns));
 };
 
 struct TableItem
