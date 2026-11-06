@@ -2199,7 +2199,9 @@ ERRSIM_POINT_DEF(EN_TABLE_SCAN_RETRY_WAIT_EVENT_ERRSIM);
 int ObTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(rand_scan_processor_.use_rand_scan())) {
+  if (OB_UNLIKELY(MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_)) {
+    ret = inner_get_next_fts_index_batch(max_row_cnt);
+  } else if (OB_UNLIKELY(rand_scan_processor_.use_rand_scan())) {
     if (OB_FAIL(rand_scan_processor_.inner_get_next_batch(max_row_cnt))) {
     }
   } else if (OB_FAIL(inner_get_next_batch_for_tsc(max_row_cnt))) {
@@ -3643,6 +3645,72 @@ int ObTableScanOp::inner_get_next_fts_index_row()
   return ret;
 }
 
+int ObTableScanOp::inner_get_next_fts_index_batch(const int64_t max_row_cnt)
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  brs_.size_ = 0;
+  brs_.end_ = false;
+  brs_.all_rows_active_ = true;
+  const int64_t capacity = MIN(max_row_cnt, MY_SPEC.max_batch_size_);
+  if (OB_UNLIKELY(capacity <= 0)) {
+    brs_.end_ = true;
+    return OB_SUCCESS;
+  }
+  const ObObjDatumMapType *types = MY_SPEC.is_fts_index_aux_
+      ? ObFTIndexRowCache::FTS_INDEX_TYPES : ObFTIndexRowCache::FTS_DOC_WORD_TYPES;
+  const ObExprOperatorType *expr_types = MY_SPEC.is_fts_index_aux_
+      ? ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE : ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE;
+  ObExpr *exprs[4] = {};
+  ObDatum *datums[4] = {};
+  ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
+  // Fetch a single source document, then expand its tokens into a batch.
+  // Do not fetch another document after producing output: doing so reuses the
+  // document arena and invalidates strings already returned in this batch.
+  guard.set_batch_idx(0);
+  guard.set_batch_size(1);
+  for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
+    if (OB_FAIL(get_output_fts_col_expr_by_type(expr_types[i], exprs[i]))) {
+    } else if (OB_ISNULL(exprs[i]) || !exprs[i]->is_batch_result()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      datums[i] = exprs[i]->locate_datums_for_update(eval_ctx_, capacity);
+    }
+  }
+  while (OB_SUCC(ret) && brs_.size_ < capacity) {
+    blocksstable::ObDatumRow *row = nullptr;
+    if (OB_FAIL(fts_index_.get_next_row(row))) {
+      if (OB_ITER_END != ret) {
+      } else if (brs_.size_ > 0) {
+        ret = OB_SUCCESS;
+        break;
+      } else if (OB_FAIL(fetch_next_fts_index_rows())) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          brs_.end_ = true;
+          break;
+        }
+      } else if (OB_FAIL(fts_index_.get_next_row(row))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
+      if (OB_FAIL(datums[i][brs_.size_].from_storage_datum(row->storage_datums_[i], types[i]))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ++brs_.size_;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    brs_.skip_->reset(brs_.size_);
+    for (int64_t i = 0; i < 4; ++i) {
+      exprs[i]->get_evaluated_flags(eval_ctx_).set_all(brs_.size_);
+      exprs[i]->set_evaluated_projected(eval_ctx_);
+    }
+  }
+  return ret;
+}
+
 int ObTableScanOp::fetch_next_fts_index_rows()
 {
   int ret = OB_SUCCESS;
@@ -3653,7 +3721,24 @@ int ObTableScanOp::fetch_next_fts_index_rows()
     ObDatum *ft_datum = nullptr;
     ObDatum *doc_id_datum = nullptr;
 
-    if (OB_FAIL(ObTableScanOp::inner_get_next_row_implement())) {
+    if (MY_SPEC.is_vectorized()) {
+      // Storage iterators opened in batch mode must also be read in batch
+      // mode, including SSTables. A one-document batch keeps expansion
+      // buffers independent while respecting that iterator contract.
+      const int64_t saved_size = brs_.size_;
+      const bool saved_end = brs_.end_;
+      const bool saved_active = brs_.all_rows_active_;
+      ret = inner_get_next_batch_for_tsc(1);
+      if (OB_SUCC(ret) && 0 == brs_.size_ && brs_.end_) {
+        ret = OB_ITER_END;
+      }
+      brs_.size_ = saved_size;
+      brs_.end_ = saved_end;
+      brs_.all_rows_active_ = saved_active;
+    } else {
+      ret = ObTableScanOp::inner_get_next_row_implement();
+    }
+    if (OB_FAIL(ret)) {
       if (OB_ITER_END != ret) {
       }
     } else if (OB_FAIL(get_output_fts_col_expr_by_type(T_FUN_SYS_DOC_ID, doc_id_expr))) {

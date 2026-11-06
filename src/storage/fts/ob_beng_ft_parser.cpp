@@ -76,7 +76,7 @@ int ObBEngFTParser::init(ObFTParserParam *param)
     analysis_ctx_.cs_ = param->cs_;
     analysis_ctx_.filter_stopword_ = false;
     analysis_ctx_.need_grouping_ = false;
-    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, *param->allocator_))) {
+    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, metadata_allocator_))) {
     } else if (OB_FAIL(segment(doc_, token_stream_))) {
     } else if (OB_ISNULL(token_stream_)) {
       ret = OB_ERR_UNEXPECTED;
@@ -88,6 +88,28 @@ int ObBEngFTParser::init(ObFTParserParam *param)
     reset();
   }
   return ret;
+}
+
+int ObBEngFTParser::reuse_document(ObFTParserParam *param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_ || nullptr == param || !param->is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY(UINT32_MAX < param->ft_length_)) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    doc_.set_string(param->fulltext_, param->ft_length_);
+    ret = segment(doc_, token_stream_);
+  }
+  return ret;
+}
+
+void ObBEngFTParser::release_document()
+{
+  if (nullptr != token_stream_) {
+    token_stream_->reuse();
+  }
+  doc_.reset();
 }
 
 int ObBEngFTParser::segment(

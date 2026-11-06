@@ -12039,12 +12039,37 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    // BM25 clamps IDF to a positive epsilon, so a natural-language match is
+    // positive exactly when at least one posting matches. If every use is a
+    // truth test, we can retain that truth value without calculating a score.
+    // Numeric projections, ORDER BY, nonzero thresholds and boolean-mode
+    // weights still require the original scoring path. Exclude subqueries
+    // here because they may carry correlated uses outside these expr roots.
+    if (T_FUN_MATCH_AGAINST == match_against->get_expr_type()
+        && NATURAL_LANGUAGE_MODE == match_against->get_mode_flag()
+        && match_against->get_columns_boosts().empty()
+        && get_stmt()->is_select_stmt() && 0 == get_stmt()->get_subquery_expr_size()) {
+      ObSEArray<ObExprConstraint, 2> constraints;
+      bool need_score = false;
+      if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(
+              get_optimizer_context().get_exec_ctx(), *get_stmt(), match_against,
+              need_score, constraints))) {
+      }
+      if (OB_SUCC(ret) && !need_score) {
+        if (OB_FAIL(append_array_no_dup(
+                get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
+        } else {
+          tr_info.need_calc_relevance_ = false;
+        }
+      }
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
       table_scan->set_rowkey_doc_table_id(tr_info.rowkey_idx_tid_);
     }
-    if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
     } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
     }
   }

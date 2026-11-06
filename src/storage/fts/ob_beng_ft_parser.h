@@ -34,7 +34,11 @@ public:
   static const int64_t FT_MAX_WORD_LEN = 84;
 public:
   explicit ObBEngFTParser(common::ObIAllocator &allocator)
+    : ObBEngFTParser(allocator, allocator)
+  {}
+  ObBEngFTParser(common::ObIAllocator &allocator, common::ObIAllocator &metadata_allocator)
     : allocator_(allocator),
+      metadata_allocator_(metadata_allocator),
       analysis_ctx_(),
       english_analyzer_(),
       doc_(),
@@ -44,6 +48,8 @@ public:
   ~ObBEngFTParser() { reset(); }
 
   int init(ObFTParserParam *param);
+  int reuse_document(ObFTParserParam *param);
+  void release_document();
   void reset();
   virtual int get_next_token(
       const char *&word,
@@ -58,6 +64,7 @@ private:
       share::ObITokenStream *&token_stream);
 private:
   common::ObIAllocator &allocator_;
+  common::ObIAllocator &metadata_allocator_;
   share::ObTextAnalysisCtx analysis_ctx_;
   share::ObEnglishTextAnalyzer english_analyzer_;
   common::ObDatum doc_;

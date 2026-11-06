@@ -23,6 +23,7 @@
 #include "common/json_type/ob_json_tree.h"
 #include "share/ob_force_print_log.h"
 #include "storage/fts/dict/ob_ft_dict_hub.h"
+#include "storage/fts/dict/ob_ft_range_dict.h"
 #include "storage/fts/ob_beng_ft_parser.h"
 #include "storage/fts/ob_ik_ft_parser.h"
 #include "storage/fts/ob_ngram2_ft_parser.h"
@@ -35,6 +36,56 @@ namespace oceanbase
 {
 namespace storage
 {
+
+// The embedded IK dictionaries are immutable for the process lifetime.
+// Share their initialized range readers and pinned cache handles, rather
+// than reconstructing three readers for every statement or document.
+class IKBuiltinDictionaries final
+{
+private:
+  ObArenaAllocator allocator_{lib::ObMemAttr("IKBuiltinDicts")};
+  ObFTCacheRangeContainer main_cache_{allocator_};
+  ObFTCacheRangeContainer quan_cache_{allocator_};
+  ObFTCacheRangeContainer stop_cache_{allocator_};
+public:
+  ObIFTDict *main_ = nullptr;
+  ObIFTDict *quan_ = nullptr;
+  ObIFTDict *stop_ = nullptr;
+  ~IKBuiltinDictionaries()
+  {
+    OB_DELETEx(ObIFTDict, &allocator_, main_);
+    OB_DELETEx(ObIFTDict, &allocator_, quan_);
+    OB_DELETEx(ObIFTDict, &allocator_, stop_);
+  }
+  int init(ObFTDictHub &hub)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(init_one(hub, ObFTDictDesc("main_dict", ObFTDictType::DICT_IK_MAIN,
+            CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN), main_cache_, main_))) {
+    } else if (OB_FAIL(init_one(hub, ObFTDictDesc("quan_dict", ObFTDictType::DICT_IK_QUAN,
+            CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN), quan_cache_, quan_))) {
+    } else if (OB_FAIL(init_one(hub, ObFTDictDesc("stopword", ObFTDictType::DICT_IK_STOP,
+            CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN), stop_cache_, stop_))) {
+    }
+    return ret;
+  }
+private:
+  int init_one(ObFTDictHub &hub, const ObFTDictDesc &desc,
+               ObFTCacheRangeContainer &cache, ObIFTDict *&dict)
+  {
+    int ret = hub.load_cache(desc, cache);
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = hub.build_cache(desc, cache);
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(dict = OB_NEWx(ObFTRangeDict, &allocator_, allocator_, &cache, desc))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      ret = dict->init();
+    }
+    return ret;
+  }
+};
 
 const char *ObFTParser::NAME_STR[ObFTParser::ParserType::FTP_MAX] = {
 #define FT_PARSER_TYPE(ftp_type, parser_name) #parser_name,
@@ -225,6 +276,10 @@ int ObFTParseData::init_dict_hub()
 
 void ObFTParseData::destroy()
 {
+  // Global teardown runs after query workers have stopped, as for the
+  // existing stop-word checker. Release dictionary pins before the hub.
+  auto *dictionaries = ik_dictionaries_.exchange(nullptr, std::memory_order_acq_rel);
+  OB_DELETEx(IKBuiltinDictionaries, &handler_allocator_, dictionaries);
   if (OB_NOT_NULL(stop_word_checker_)) {
     stop_word_checker_->destroy();
     OB_DELETEx(ObStopWordChecker, &handler_allocator_, stop_word_checker_);
@@ -240,6 +295,34 @@ void ObFTParseData::destroy()
 
   handler_allocator_.reset();
   is_inited_ = false;
+}
+
+int ObFTParseData::get_ik_dictionaries(ObIFTDict *&main, ObIFTDict *&quan, ObIFTDict *&stop)
+{
+  int ret = OB_SUCCESS;
+  auto *dictionaries = ik_dictionaries_.load(std::memory_order_acquire);
+  if (OB_UNLIKELY(!is_inited_ || nullptr == dict_hub_)) {
+    ret = OB_NOT_INIT;
+  } else if (nullptr == dictionaries) {
+    std::lock_guard<std::mutex> guard(ik_dictionaries_mutex_);
+    dictionaries = ik_dictionaries_.load(std::memory_order_relaxed);
+    if (nullptr == dictionaries) {
+      if (OB_ISNULL(dictionaries = OB_NEWx(IKBuiltinDictionaries, &handler_allocator_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(dictionaries->init(*dict_hub_))) {
+        OB_DELETEx(IKBuiltinDictionaries, &handler_allocator_, dictionaries);
+      } else {
+        // Publish only after every reader and all its cache pins are ready.
+        ik_dictionaries_.store(dictionaries, std::memory_order_release);
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    main = dictionaries->main_;
+    quan = dictionaries->quan_;
+    stop = dictionaries->stop_;
+  }
+  return ret;
 }
 
 int ObFTParseData::get_dict_hub(ObFTDictHub *&hub)
@@ -315,6 +398,10 @@ ObFTParseHelper::ObFTParseHelper()
     parser_name_(),
     add_word_flag_(),
     parser_property_(),
+    metadata_allocator_(lib::ObMemAttr("FTParserMeta")),
+    ik_parser_(nullptr),
+    beng_parser_(nullptr),
+    cached_charset_(nullptr),
     is_inited_(false)
 {
 }
@@ -352,10 +439,87 @@ int ObFTParseHelper::init(
 
 void ObFTParseHelper::reset()
 {
+  reset_cached_parsers();
   parser_desc_ = nullptr;
   allocator_ = nullptr;
   add_word_flag_.clear();
   is_inited_ = false;
+}
+
+void ObFTParseHelper::reset_cached_parsers() const
+{
+  OB_DELETEx(ObIKFTParser, &metadata_allocator_, ik_parser_);
+  OB_DELETEx(ObBEngFTParser, &metadata_allocator_, beng_parser_);
+  cached_charset_ = nullptr;
+  metadata_allocator_.reset();
+}
+
+int ObFTParseHelper::segment_reusing_parser(const ObCharsetInfo *cs, const char *ft,
+                                           const int64_t ft_len, ObAddWord &add_word) const
+{
+  int ret = OB_SUCCESS;
+  ObFTParserParam param;
+  param.cs_ = cs;
+  param.fulltext_ = ft;
+  param.ft_length_ = ft_len;
+  param.allocator_ = allocator_;
+  param.parser_version_ = parser_name_.get_parser_version();
+  param.ik_param_.mode_ = parser_property_.ik_mode_smart_
+      ? ObFTIKParam::Mode::SMART : ObFTIKParam::Mode::MAX_WORD;
+  ObITokenIterator *iter = nullptr;
+  if (cached_charset_ != cs) {
+    reset_cached_parsers();
+    cached_charset_ = cs;
+  }
+  if (OB_UNLIKELY(!param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (parser_name_.is_ik()) {
+    if (nullptr == ik_parser_) {
+      ObFTDictHub *hub = nullptr;
+      if (OB_FAIL(ObFTParseData::instance().get_dict_hub(hub))) {
+      } else if (OB_ISNULL(ik_parser_ = OB_NEWx(ObIKFTParser, &metadata_allocator_,
+                                                *allocator_, hub))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(ik_parser_->init(param))) {
+      }
+    } else if (OB_FAIL(ik_parser_->reuse_document(param))) {
+    }
+    iter = ik_parser_;
+  } else {
+    if (nullptr == beng_parser_) {
+      if (OB_ISNULL(beng_parser_ = OB_NEWx(ObBEngFTParser, &metadata_allocator_,
+                                            *allocator_, metadata_allocator_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(beng_parser_->init(&param))) {
+      }
+    } else if (OB_FAIL(beng_parser_->reuse_document(&param))) {
+    }
+    iter = beng_parser_;
+  }
+  while (OB_SUCC(ret)) {
+    const char *word = nullptr;
+    int64_t word_len = 0, char_cnt = 0, word_freq = 0;
+    if (OB_FAIL(iter->get_next_token(word, word_len, char_cnt, word_freq))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        break;
+      }
+    } else if (OB_FAIL(add_word.process_word(word, word_len, char_cnt, word_freq))) {
+    }
+  }
+  // Release document objects before callers reset their document arena.
+  // Both parsers materialize accepted word bytes in that arena, so the map
+  // remains valid until its owner has serialized or consumed the result.
+  if (nullptr != ik_parser_) {
+    ik_parser_->release_document();
+  }
+  if (nullptr != beng_parser_) {
+    beng_parser_->release_document();
+  }
+  if (OB_FAIL(ret)) {
+    reset_cached_parsers();
+  }
+  return ret;
 }
 
 int ObFTParseHelper::segment(
@@ -379,7 +543,9 @@ int ObFTParseHelper::segment(
   } else {
     words.reuse();
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
-    if (OB_FAIL(segment(
+    if ((parser_name_.is_ik() || parser_name_.is_beng())
+        && OB_FAIL(segment_reusing_parser(cs, fulltext, fulltext_len, add_word))) {
+    } else if (!(parser_name_.is_ik() || parser_name_.is_beng()) && OB_FAIL(segment(
                     parser_property_,
                     parser_name_.get_parser_version(),
                     parser_desc_,

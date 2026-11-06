@@ -12804,6 +12804,25 @@ bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
   return !stmt.has_order_by() && is_only_full_group_by_on(mode);
 }
 
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt &stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 16> roots;
+  need_calc = false;
+  if (OB_FAIL(stmt.get_relation_exprs(roots))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < roots.count(); ++i) {
+    if (OB_FAIL(inner_check_need_calc_match_score(
+            exec_ctx, roots.at(i), match_expr, need_calc, constraints))) {
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                         ObRawExpr* expr, 
                                                         ObRawExpr* match_expr, 

@@ -1,0 +1,140 @@
+DROP DATABASE IF EXISTS fts_bulk_build_consistency;
+CREATE DATABASE fts_bulk_build_consistency;
+USE fts_bulk_build_consistency;
+CREATE TABLE docs(id INT PRIMARY KEY, title TEXT, body TEXT, en TEXT);
+INSERT INTO docs VALUES
+(0,'全文索引','数据库 alpha alpha beta','alpha alpha beta'),
+(1,'数据库','全文索引 beta gamma','beta gamma'),
+(2,'中文 分词器','数据库 alpha gamma','alpha gamma'),
+(3,'OceanBase 稳定','中文 分词器 delta','delta delta'),
+(4,'混合 database','全文索引 alpha beta gamma','alpha beta gamma'),
+(5,'中华人民共和国','人民大会堂 一百二十三个人','the THE with www'),
+(6,'',NULL,''), (7,NULL,'',NULL);
+INSERT INTO docs SELECT id+8,title,body,en FROM docs;
+INSERT INTO docs SELECT id+16,title,body,en FROM docs;
+INSERT INTO docs SELECT id+32,title,body,en FROM docs;
+INSERT INTO docs SELECT id+64,title,body,en FROM docs;
+INSERT INTO docs SELECT id+128,title,body,en FROM docs;
+INSERT INTO docs SELECT id+256,title,body,en FROM docs;
+INSERT INTO docs SELECT id+512,title,body,en FROM docs;
+INSERT INTO docs SELECT id+1024,title,body,en FROM docs;
+SET @saved_group_concat_max_len=@@group_concat_max_len;
+SET SESSION group_concat_max_len=1048576;
+SET @long_doc=(SELECT GROUP_CONCAT(CONCAT('uniquetoken',id) ORDER BY id SEPARATOR ' ') FROM docs WHERE id<1300);
+UPDATE docs SET body=CONCAT('数据库 alpha ',@long_doc),en=CONCAT('alpha ',@long_doc) WHERE id=0;
+SET SESSION group_concat_max_len=@saved_group_concat_max_len;
+ALTER TABLE docs ADD FULLTEXT INDEX fi_all(title,body) WITH PARSER ik;
+ALTER TABLE docs ADD FULLTEXT INDEX fi_body(body) WITH PARSER ik;
+ALTER TABLE docs ADD FULLTEXT INDEX fi_en(en) WITH PARSER beng;
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(title,body) AGAINST('全文索引 分词器');
+COUNT(*)	SUM(id)
+1280	1308160
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('数据库 alpha');
+COUNT(*)	SUM(id)
+768	784896
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST('alpha beta');
+COUNT(*)	SUM(id)
+1024	1046272
+SELECT id FROM docs WHERE MATCH(en) AGAINST('uniquetoken0 uniquetoken1023 uniquetoken1299') ORDER BY id;
+id
+0
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('数据库 alpha') LIMIT 20 OFFSET 3) t;
+COUNT(*)
+20
+SELECT id,ROUND(MATCH(en) AGAINST('alpha beta'),8) AS score FROM docs
+WHERE MATCH(en) AGAINST('alpha beta') ORDER BY score DESC,id LIMIT 6;
+id	score
+8	1.59248000
+16	1.59248000
+24	1.59248000
+32	1.59248000
+40	1.59248000
+48	1.59248000
+SELECT COUNT(*),SUM(CASE WHEN MATCH(en) AGAINST('alpha beta') THEN 1 ELSE 0 END)
+FROM docs WHERE MATCH(en) AGAINST('alpha beta');
+COUNT(*)	SUM(CASE WHEN MATCH(en) AGAINST('alpha beta') THEN 1 ELSE 0 END)
+1024	1024
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST('alpha beta') > 0.2;
+COUNT(*)	SUM(id)
+1023	1046272
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST('alpha beta') = 0;
+COUNT(*)	SUM(id)
+1024	1049856
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST('alpha beta') OR MOD(id,3)=0;
+COUNT(*)	SUM(id)
+1366	1396906
+SELECT id FROM docs WHERE MATCH(en) AGAINST('+alpha -beta' IN BOOLEAN MODE) ORDER BY id LIMIT 6;
+id
+0
+2
+10
+18
+26
+34
+PREPARE threshold_query FROM 'SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST(?) > ?';
+SET @term='alpha beta';
+SET @threshold=0;
+EXECUTE threshold_query USING @term,@threshold;
+COUNT(*)	SUM(id)
+1024	1046272
+SET @threshold=0.8;
+EXECUTE threshold_query USING @term,@threshold;
+COUNT(*)	SUM(id)
+511	523264
+SET @threshold=0;
+EXECUTE threshold_query USING @term,@threshold;
+COUNT(*)	SUM(id)
+1024	1046272
+SET @threshold=NULL;
+EXECUTE threshold_query USING @term,@threshold;
+COUNT(*)	SUM(id)
+0	NULL
+DEALLOCATE PREPARE threshold_query;
+PREPARE term_query FROM 'SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST(?)';
+SET @term=@long_doc;
+EXECUTE term_query USING @term;
+COUNT(*)	SUM(id)
+1	0
+SET @term='alpha';
+EXECUTE term_query USING @term;
+COUNT(*)	SUM(id)
+768	784896
+SET @term='nonexistenttoken';
+EXECUTE term_query USING @term;
+COUNT(*)	SUM(id)
+0	NULL
+SET @term='';
+EXECUTE term_query USING @term;
+COUNT(*)	SUM(id)
+0	NULL
+DEALLOCATE PREPARE term_query;
+UPDATE docs SET body='数据库 beta delta',en='beta delta' WHERE MOD(id,7)=0;
+DELETE FROM docs WHERE MOD(id,5)=0;
+INSERT INTO docs VALUES(4096,'中文 分词器','数据库 alpha','alpha beta');
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(title,body) AGAINST('全文索引 分词器');
+COUNT(*)	SUM(id)
+938	960305
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST('alpha beta');
+COUNT(*)	SUM(id)
+937	960285
+SELECT id,ROUND(MATCH(en) AGAINST('alpha beta'),8) AS score FROM docs
+WHERE MATCH(en) AGAINST('alpha beta') ORDER BY score DESC,id LIMIT 6;
+id	score
+8	2.54949631
+16	2.54949631
+24	2.54949631
+32	2.54949631
+48	2.54949631
+64	2.54949631
+ALTER TABLE docs DROP INDEX fi_body;
+ALTER TABLE docs ADD FULLTEXT INDEX fi_body(body) WITH PARSER ik;
+SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(body) AGAINST('数据库 alpha');
+COUNT(*)	SUM(id)
+761	781613
+CREATE TABLE empty_docs(id INT PRIMARY KEY,body TEXT);
+ALTER TABLE empty_docs ADD FULLTEXT INDEX fi(body) WITH PARSER ik;
+INSERT INTO empty_docs VALUES(1,NULL),(2,''),(3,'数据库 alpha');
+SELECT id FROM empty_docs WHERE MATCH(body) AGAINST('数据库 alpha') ORDER BY id;
+id
+3
+DROP DATABASE fts_bulk_build_consistency;

@@ -176,6 +176,11 @@ class ObTransformUtils
   static const uint64_t MAX_SET_STMT_SIZE_OF_COSTED_BASED_RELUES = 20;
 
 public:
+  static int check_need_calc_match_score(ObExecContext *exec_ctx,
+                                         const ObDMLStmt &stmt,
+                                         ObRawExpr *match_expr,
+                                         bool &need_calc,
+                                         ObIArray<ObExprConstraint> &constraints);
   struct LazyJoinInfo {
     LazyJoinInfo()
       :join_conditions_(),

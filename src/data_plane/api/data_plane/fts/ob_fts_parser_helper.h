@@ -18,6 +18,7 @@
 #define OB_FTS_PARSER_HELPER_H_
 
 #include "lib/allocator/ob_fifo_allocator.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/string/ob_string.h"
 #include "object/ob_object.h"
@@ -25,6 +26,8 @@
 #include "data_plane/fts/ob_fts_parser_name.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
 #include "data_plane/fts/ob_fts_struct.h"
+#include <atomic>
+#include <mutex>
 
 namespace oceanbase
 {
@@ -39,6 +42,10 @@ namespace storage
 class ObStopWordChecker;
 class ObFTDictHub;
 class ObAddWord;
+class ObIKFTParser;
+class ObBEngFTParser;
+class ObIFTDict;
+class IKBuiltinDictionaries;
 
 #define FTS_BUILD_IN_PARSER_LIST                                                                   \
   FT_PARSER_TYPE(FTP_SPACE, space)                                                                 \
@@ -119,6 +126,7 @@ public:
 public:
   ObStopWordChecker *stop_word_checker() const { return stop_word_checker_; }
   int get_dict_hub(ObFTDictHub *&hub);
+  int get_ik_dictionaries(ObIFTDict *&main, ObIFTDict *&quan, ObIFTDict *&stop);
 
 private:
   int init_and_set_stopword_list();
@@ -128,6 +136,8 @@ private:
   ObStopWordChecker *     stop_word_checker_ = nullptr;
   ObFTDictHub *           dict_hub_          = nullptr;
   common::ObFIFOAllocator handler_allocator_;
+  std::atomic<IKBuiltinDictionaries *> ik_dictionaries_{nullptr};
+  std::mutex ik_dictionaries_mutex_;
   bool                    is_inited_         = false;
 };
 
@@ -207,6 +217,9 @@ public:
   TO_STRING_KV(KP_(allocator), K_(parser_name), KP_(parser_desc), K_(is_inited));
 
 private:
+  int segment_reusing_parser(const ObCharsetInfo *cs, const char *ft,
+                             const int64_t ft_len, ObAddWord &add_word) const;
+  void reset_cached_parsers() const;
   static int segment(
       const ObFTParserProperty &property,
       const int64_t parser_version,
@@ -223,6 +236,12 @@ private:
   ObFTParser parser_name_;
   ObAddWordFlag add_word_flag_;
   ObFTParserProperty parser_property_;
+  // Helpers are owned by one expression or scan. Dictionary handles and
+  // analyzer objects survive documents; all token data stays in allocator_.
+  mutable common::ObArenaAllocator metadata_allocator_;
+  mutable ObIKFTParser *ik_parser_;
+  mutable ObBEngFTParser *beng_parser_;
+  mutable const ObCharsetInfo *cached_charset_;
   bool is_inited_;
 
 private:

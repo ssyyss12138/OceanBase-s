@@ -1,0 +1,100 @@
+DROP DATABASE IF EXISTS fts_tokenize_reuse;
+CREATE DATABASE fts_tokenize_reuse;
+USE fts_tokenize_reuse;
+CREATE TABLE inputs(id INT PRIMARY KEY,body VARCHAR(2048),parser VARCHAR(16),props VARCHAR(1024));
+INSERT INTO inputs VALUES
+(0,'数据库全文索引 中华人民共和国','ik','[{"output":"all"}]'),
+(1,'alpha ALPHA beta the thé café','beng','[{"output":"all"}]'),
+(2,'beta beta gamma','beng','[{"output":"default"}]'),
+(3,'a abc abcdef abcdefghijk','space','[{"output":"all"},{"additional_args":[{"min_token_size":5},{"max_token_size":10}]}]'),
+(4,'中华人民共和国 人民大会堂','ik','[{"output":"all"},{"additional_args":[{"ik_mode":"max_word"}]}]'),
+(5,NULL,'beng','[{"output":"all"}]'),
+(6,'','ik','[{"output":"all"}]'),
+(7,'日本語 한글 😀 𠮷 𠀀 Straße','ngram','[{"output":"all"}]'),
+(8,'a abc abcdef abcdefghijk','beng','[{"output":"all"},{"additional_args":[{"min_token_size":5},{"max_token_size":10}]}]'),
+(9,'中文分词器 一百二十三个人 😀','ik','[{"output":"all"},{"additional_args":[{"ik_mode":"smart"}]}]'),
+(10,'gamma GAMMA gamma beta','beng','[{"output":"all"}]'),
+(11,'alpha','beng','[{"output":"all"}]');
+SELECT id,TOKENIZE(body,parser,props) AS tokens FROM inputs ORDER BY id;
+id	tokens
+0	{"tokens": [{"数据库": 1}, {"中华人民共和国": 1}, {"全文索引": 1}], "doc_len": 3}
+1	{"tokens": [{"café": 1}, {"alpha": 2}, {"beta": 1}], "doc_len": 4}
+2	["gamma", "beta"]
+3	{"tokens": [{"abcdef": 1}], "doc_len": 1}
+4	{"tokens": [{"大会": 1}, {"人民大会堂": 1}, {"大会堂": 1}, {"共和国": 1}, {"人民大会": 1}, {"人民共和国": 1}, {"中华人民": 1}, {"共和": 1}, {"国": 1}, {"会堂": 1}, {"中华": 1}, {"中华人民共和国": 1}, {"华人": 1}, {"人民": 2}], "doc_len": 15}
+5	{"tokens": [], "doc_len": 0}
+6	{"tokens": [], "doc_len": 0}
+7	{"tokens": [{"st": 1}, {"ße": 1}, {"한글": 1}, {"tr": 1}, {"aß": 1}, {"日本": 1}, {"本語": 1}, {"ra": 1}], "doc_len": 8}
+8	{"tokens": [{"abcdef": 1}], "doc_len": 1}
+9	{"tokens": [{"个人": 1}, {"分词器": 1}, {"一百二十三": 1}, {"中文": 1}], "doc_len": 4}
+10	{"tokens": [{"gamma": 3}, {"beta": 1}], "doc_len": 4}
+11	{"tokens": [{"alpha": 1}], "doc_len": 1}
+CREATE TABLE repeated LIKE inputs;
+INSERT INTO repeated SELECT * FROM inputs;
+INSERT INTO repeated SELECT id+12,body,parser,props FROM repeated;
+INSERT INTO repeated SELECT id+24,body,parser,props FROM repeated;
+INSERT INTO repeated SELECT id+48,body,parser,props FROM repeated;
+INSERT INTO repeated SELECT id+96,body,parser,props FROM repeated;
+INSERT INTO repeated SELECT id+192,body,parser,props FROM repeated;
+INSERT INTO repeated SELECT id+384,body,parser,props FROM repeated;
+INSERT INTO repeated SELECT id+768,body,parser,props FROM repeated;
+SELECT COUNT(*),SUM(CRC32(CAST(TOKENIZE(body,parser,props) AS CHAR))) AS token_checksums FROM repeated;
+COUNT(*)	token_checksums
+1536	3953940993664
+SELECT id,TOKENIZE(body,'beng','[{"output":"all"}]') AS tokens FROM inputs WHERE id IN (1,2,5,8,10,11) ORDER BY id;
+id	tokens
+1	{"tokens": [{"café": 1}, {"alpha": 2}, {"beta": 1}], "doc_len": 4}
+2	{"tokens": [{"gamma": 1}, {"beta": 2}], "doc_len": 3}
+5	{"tokens": [], "doc_len": 0}
+8	{"tokens": [{"abcdef": 1}, {"abcdefghijk": 1}, {"abc": 1}], "doc_len": 3}
+10	{"tokens": [{"gamma": 3}, {"beta": 1}], "doc_len": 4}
+11	{"tokens": [{"alpha": 1}], "doc_len": 1}
+SELECT id,TOKENIZE(body,'ik','[{"output":"all"}]') AS tokens FROM inputs WHERE id IN (0,4,6,9) ORDER BY id;
+id	tokens
+0	{"tokens": [{"数据库": 1}, {"中华人民共和国": 1}, {"全文索引": 1}], "doc_len": 3}
+4	{"tokens": [{"人民大会堂": 1}, {"中华人民共和国": 1}], "doc_len": 2}
+6	{"tokens": [], "doc_len": 0}
+9	{"tokens": [{"个人": 1}, {"分词器": 1}, {"一百二十三": 1}, {"中文": 1}], "doc_len": 4}
+PREPARE tokenize_bound FROM 'SELECT TOKENIZE(?,?,?) AS tokens';
+SET @body='alpha ALPHA beta';
+SET @parser='beng';
+SET @props='[{"output":"all"}]';
+EXECUTE tokenize_bound USING @body,@parser,@props;
+tokens
+{"tokens": [{"alpha": 2}, {"beta": 1}], "doc_len": 3}
+SET @body='gamma gamma';
+EXECUTE tokenize_bound USING @body,@parser,@props;
+tokens
+{"tokens": [{"gamma": 2}], "doc_len": 2}
+SET @props='[{"output":"default"}]';
+EXECUTE tokenize_bound USING @body,@parser,@props;
+tokens
+["gamma"]
+SET @body='中华人民共和国 人民大会堂';
+SET @parser='ik';
+SET @props='[{"output":"all"},{"additional_args":[{"ik_mode":"smart"}]}]';
+EXECUTE tokenize_bound USING @body,@parser,@props;
+tokens
+{"tokens": [{"人民大会堂": 1}, {"中华人民共和国": 1}], "doc_len": 2}
+SET @props='[{"output":"all"},{"additional_args":[{"ik_mode":"max_word"}]}]';
+EXECUTE tokenize_bound USING @body,@parser,@props;
+tokens
+{"tokens": [{"大会": 1}, {"人民大会堂": 1}, {"大会堂": 1}, {"共和国": 1}, {"人民大会": 1}, {"人民共和国": 1}, {"中华人民": 1}, {"共和": 1}, {"国": 1}, {"会堂": 1}, {"中华": 1}, {"中华人民共和国": 1}, {"华人": 1}, {"人民": 2}], "doc_len": 15}
+SET @body='';
+EXECUTE tokenize_bound USING @body,@parser,@props;
+tokens
+{"tokens": [], "doc_len": 0}
+SET @body='alpha beta gamma';
+SET @parser='beng';
+SET @props='[{"output":"all"}]';
+EXECUTE tokenize_bound USING @body,@parser,@props;
+tokens
+{"tokens": [{"gamma": 1}, {"alpha": 1}, {"beta": 1}], "doc_len": 3}
+DEALLOCATE PREPARE tokenize_bound;
+SELECT BENCHMARK(100,TOKENIZE('数据库全文索引 alpha beta','ik','[{"output":"all"}]'));
+BENCHMARK(100,TOKENIZE('数据库全文索引 alpha beta','ik','[{"output":"all"}]'))
+0
+SELECT BENCHMARK(100,TOKENIZE('alpha alpha beta gamma the thé','beng','[{"output":"all"}]'));
+BENCHMARK(100,TOKENIZE('alpha alpha beta gamma the thé','beng','[{"output":"all"}]'))
+0
+DROP DATABASE fts_tokenize_reuse;

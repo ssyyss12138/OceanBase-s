@@ -39,6 +39,62 @@ namespace oceanbase
 {
 namespace sql
 {
+// Per execution-context metadata only; document contents and token results
+// are recomputed on every evaluation, including BENCHMARK and prepared binds.
+class TokenizeExprContext final : public ObExprOperatorCtx
+{
+private:
+  // Declare arenas before their users so they are destroyed last.
+  ObArenaAllocator key_allocator_;
+  ObArenaAllocator document_allocator_;
+  ObString parser_;
+  ObString properties_;
+  int64_t bucket_count_;
+  bool ready_;
+public:
+  TokenizeExprContext()
+    : key_allocator_(ObMemAttr("FtsTokKeys")),
+      document_allocator_(ObMemAttr("FtsTokDoc")), bucket_count_(0), ready_(false)
+  {}
+  ~TokenizeExprContext() override
+  {
+    words_.destroy();
+    helper_.reset();
+  }
+
+  int prepare(const ObString &parser, const ObString &properties, const int64_t bucket_count)
+  {
+    int ret = OB_SUCCESS;
+    if (words_.created()) {
+      words_.reuse();
+    }
+    document_allocator_.reuse();
+    if (!ready_ || parser_ != parser || properties_ != properties) {
+      ready_ = false;
+      helper_.reset();
+      key_allocator_.reuse();
+      if (OB_FAIL(ob_write_string(key_allocator_, parser, parser_))) {
+      } else if (OB_FAIL(ob_write_string(key_allocator_, properties, properties_))) {
+      } else if (OB_FAIL(helper_.init(&document_allocator_, parser_, properties_))) {
+      } else {
+        ready_ = true;
+      }
+    }
+    if (OB_SUCC(ret) && bucket_count_ != bucket_count) {
+      words_.destroy();
+      bucket_count_ = 0;
+      if (OB_FAIL(words_.create(bucket_count, ObMemAttr("FTWordMap")))) {
+      } else {
+        bucket_count_ = bucket_count;
+      }
+    }
+    return ret;
+  }
+
+  storage::ObFTParseHelper helper_;
+  storage::ObFTWordMap words_;
+};
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -64,7 +120,7 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, expr, ctx, json_result))) {
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
                                                      temp_allocator,
@@ -77,40 +133,37 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 
 int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       TokenizeParam::OUTPUT_MODE mode,
-                                      ObIAllocator &allocator,
+                                      const ObExpr &expr, ObEvalCtx &ctx,
                                       ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParseHelper tokenize_helper;
+  auto *cached = static_cast<TokenizeExprContext *>(ctx.exec_ctx_.get_expr_op_ctx(expr.expr_ctx_id_));
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
-  storage::ObFTWordMap token_map;
-
-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
-  } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (nullptr == cached && OB_FAIL(ctx.exec_ctx_.create_expr_op_ctx(expr.expr_ctx_id_, cached))) {
+  } else if (OB_FAIL(cached->prepare(param.parser_name_, param.properties_, ft_word_bkt_cnt))) {
   } else if (
       (0 != param.fulltext_.length())
-      && OB_FAIL(tokenize_helper.segment(
+      && OB_FAIL(cached->helper_.segment(
                      param.meta_,
                      param.fulltext_.ptr(),
                      param.fulltext_.length(),
                      doc_len,
-                     token_map))) {
+                     cached->words_))) {
   } else {
     switch (param.output_mode_) {
     case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
+      if (OB_FAIL(cached->helper_.make_token_array_json(cached->words_, result))) {
       } else {
         // pass
       }
       break;
     }
     case TokenizeParam::OUTPUT_MODE::ALL: {
-      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
+      if (OB_FAIL(cached->helper_.make_detail_json(cached->words_, doc_len, result))) {
       } else {
         // pass
       }

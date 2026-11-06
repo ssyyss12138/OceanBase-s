@@ -33,6 +33,7 @@ class ObExprTokenize : public ObStringExprOperator
 public:
   explicit ObExprTokenize(common::ObIAllocator &alloc);
   ~ObExprTokenize() override;
+  bool need_rt_ctx() const override { return true; }
   /**
    * @brief evaluate function
    * @param expr expression
@@ -95,7 +96,7 @@ private:
 
   static int tokenize_fulltext(const TokenizeParam &param,
                                TokenizeParam::OUTPUT_MODE mode,
-                               common::ObIAllocator &allocator,
+                               const ObExpr &expr, ObEvalCtx &ctx,
                                ObIJsonBase *&result);
 
   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
