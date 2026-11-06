@@ -6955,9 +6955,29 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
   } else {
     can_sort_opt &= config::_enable_newsort();
 
+    // FTS expansion produces many more sort rows than the source-table
+    // estimate. Encode its word/doc-id keys once instead of repeatedly
+    // applying the collation in the comparison sort. Keep this exception
+    // local to FTS auxiliary-table builds, not arbitrary VARCHAR sorts.
+    bool is_fts_build = false;
+    ObOptimizerContext &opt_ctx = plan.get_optimizer_context();
+    if (can_sort_opt && opt_ctx.is_insert_stmt_in_online_ddl()) {
+      const TableItem *item = opt_ctx.get_root_stmt()->get_table_item(0);
+      const share::schema::ObTableSchema *schema = nullptr;
+      if (OB_ISNULL(item) || OB_ISNULL(opt_ctx.get_sql_schema_guard())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(opt_ctx.get_sql_schema_guard()->get_table_schema(item->ddl_table_id_, schema))) {
+      } else if (OB_ISNULL(schema)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        is_fts_build = schema->is_fts_index_aux() || schema->is_fts_doc_word_aux();
+      }
+    }
+
     for (int64_t i = 0; OB_SUCC(ret) && can_sort_opt && i < order_keys.count(); i++) {
+      const ObObjType type = order_keys.at(i).expr_->get_data_type();
       if (!ObOrderPerservingEncoder::can_encode_sortkey(
-                            order_keys.at(i).expr_->get_data_type(),
+                            is_fts_build && ObVarcharType == type ? ObCharType : type,
                             order_keys.at(i).expr_->get_collation_type())) {
         can_sort_opt = false;
       } else if (OB_FAIL(sort_keys.push_back(order_keys.at(i).expr_))) {
@@ -6970,6 +6990,8 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
       // do nothing
     } else if (!can_sort_opt) {
       // do nothing
+    } else if (is_fts_build) {
+      // The normal cardinality/width policy uses pre-expansion estimates.
     } else if (OB_FAIL(ObOptEstCost::estimate_width_for_exprs(plan.get_basic_table_metas(),
                                                               plan.get_selectivity_ctx(),
                                                               sort_keys,
