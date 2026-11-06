@@ -541,6 +541,29 @@ int ObTextRetrievalDaaTTokenIter::get_next_batch(const int64_t capacity, int64_t
   return OB_NOT_IMPLEMENT;
 }
 
+int ObTextRetrievalDaaTTokenIter::get_next_doc_id_batch(const ObDocIdExt *&ids, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  ids = nullptr;
+  count = 0;
+  if (!is_inited_ || nullptr != relevance_expr_ || !eval_ctx_->is_vectorized()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    do {
+      if (OB_FAIL(THIS_WORKER.check_status())) {
+      } else if (OB_FAIL(token_iter_->get_next_batch(max_batch_size_, count_))) {
+      }
+    } while (OB_SUCC(ret) && 0 == count_);
+    if (OB_SUCC(ret) && OB_FAIL(save_docids())) {
+    }
+    if (OB_SUCC(ret)) {
+      ids = &doc_id_.at(0);
+      count = count_;
+    }
+  }
+  return ret;
+}
+
 int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
 {
   int ret = OB_SUCCESS;

@@ -91,6 +91,18 @@ COUNT(*)	SUM(id)
 0	NULL
 DEALLOCATE PREPARE threshold_query;
 PREPARE term_query FROM 'SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST(?)';
+SET @term='uniquetoken0 uniquetoken1 uniquetoken2 uniquetoken3 uniquetoken4 uniquetoken5 uniquetoken6 uniquetoken7';
+EXECUTE term_query USING @term;
+COUNT(*)	SUM(id)
+1	0
+SET @term='uniquetoken0 uniquetoken1 uniquetoken2 uniquetoken3 uniquetoken4 uniquetoken5 uniquetoken6 uniquetoken7 uniquetoken8';
+EXECUTE term_query USING @term;
+COUNT(*)	SUM(id)
+1	0
+SET @term='uniquetoken0 uniquetoken0';
+EXECUTE term_query USING @term;
+COUNT(*)	SUM(id)
+1	0
 SET @term=@long_doc;
 EXECUTE term_query USING @term;
 COUNT(*)	SUM(id)

@@ -55,12 +55,13 @@ public:
   ObTextDaaTIter() : ObSRDaaTIterImpl(),
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false), use_batch_union_(false), union_cursors_{} {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
   virtual void reuse(const bool switch_tablet = false) override;
   virtual void reset() override;
+  virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
 protected:
   virtual int pre_process() override;
 protected:
@@ -68,6 +69,16 @@ protected:
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
 private:
+  static constexpr int64_t MAX_BATCH_UNION_DIMS = 8;
+  struct UnionCursor
+  {
+    const ObDocIdExt *ids_ = nullptr;
+    int64_t size_ = 0;
+    int64_t pos_ = 0;
+    bool ended_ = false;
+  };
+  bool use_batch_union_;
+  UnionCursor union_cursors_[MAX_BATCH_UNION_DIMS];
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);
 };
 

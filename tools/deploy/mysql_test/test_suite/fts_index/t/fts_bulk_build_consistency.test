@@ -59,6 +59,12 @@ DEALLOCATE PREPARE threshold_query;
 
 # A long query exercises the TaaT fallback (more than 256 distinct tokens).
 PREPARE term_query FROM 'SELECT COUNT(*),SUM(id) FROM docs WHERE MATCH(en) AGAINST(?)';
+SET @term='uniquetoken0 uniquetoken1 uniquetoken2 uniquetoken3 uniquetoken4 uniquetoken5 uniquetoken6 uniquetoken7';
+EXECUTE term_query USING @term;
+SET @term='uniquetoken0 uniquetoken1 uniquetoken2 uniquetoken3 uniquetoken4 uniquetoken5 uniquetoken6 uniquetoken7 uniquetoken8';
+EXECUTE term_query USING @term;
+SET @term='uniquetoken0 uniquetoken0';
+EXECUTE term_query USING @term;
 SET @term=@long_doc;
 EXECUTE term_query USING @term;
 SET @term='alpha';
