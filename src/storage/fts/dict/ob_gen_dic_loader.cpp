@@ -125,20 +125,34 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(dic_loader_key.init(parser_name, charset))) {
   } else {
-    TCWLockGuard guard(lock_);
-    if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
-      if (OB_HASH_NOT_EXIST == ret) {
-        if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
-        } else if (OB_ISNULL(dic_loader)) {
+    // Published loaders are immutable map entries. Keep their handle reference
+    // under the read lock; only first use needs to serialize loader creation.
+    {
+      TCRLockGuard guard(lock_);
+      if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
+        if (OB_HASH_NOT_EXIST != ret) {
           ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(dic_loader_map_.set_refactored(dic_loader_key, dic_loader))) {
-        } else if (OB_FALSE_IT(dic_loader->inc_ref())) {
-        } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
         }
-      } else {
-        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
       }
-    } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+    }
+    if (OB_HASH_NOT_EXIST == ret) {
+      TCWLockGuard guard(lock_);
+      // Another first-use caller may have installed it before this write lock.
+      if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
+        if (OB_HASH_NOT_EXIST == ret) {
+          if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
+          } else if (OB_ISNULL(dic_loader)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(dic_loader_map_.set_refactored(dic_loader_key, dic_loader))) {
+          } else if (OB_FALSE_IT(dic_loader->inc_ref())) {
+          } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+          }
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+        }
+      } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+      }
     }
   }
   return ret;
