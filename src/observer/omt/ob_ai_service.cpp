@@ -21,6 +21,7 @@
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/ob_exec_context.h"
 #include "lib/string/ob_sql_string.h"
+#include "lib/time/ob_time_utility.h"
 #include "lib/allocator/page_arena.h"
 #include "share/ob_server_struct.h"
 #include "common/mysqlclient/ob_mysql_proxy.h"
@@ -38,6 +39,7 @@ namespace
 struct AIColumnMeta
 {
   uint64_t table_id_;
+  int64_t column_id_;
   int64_t max_retries_;
   ObString database_name_;
   ObString table_name_;
@@ -48,6 +50,47 @@ struct AIColumnMeta
 int copy_string(ObIAllocator &allocator, const ObString &src, ObString &dst)
 {
   return ob_write_string(allocator, src, dst);
+}
+
+// Retry backoff without blocking the whole worker: a column that just failed
+// with retries left is skipped for a short while so other rows keep flowing.
+const int64_t AI_DEFER_SLOTS = 64;
+uint64_t g_ai_defer_keys[AI_DEFER_SLOTS];
+int64_t g_ai_defer_until[AI_DEFER_SLOTS];
+int64_t g_ai_defer_count = 0;
+
+uint64_t ai_defer_key(const uint64_t table_id, const int64_t column_id)
+{
+  return (table_id << 20) ^ static_cast<uint64_t>(column_id);
+}
+
+bool ai_column_deferred(const uint64_t table_id, const int64_t column_id,
+                        const int64_t now)
+{
+  const uint64_t key = ai_defer_key(table_id, column_id);
+  for (int64_t i = 0; i < g_ai_defer_count; ++i) {
+    if (g_ai_defer_keys[i] == key) {
+      return now < g_ai_defer_until[i];
+    }
+  }
+  return false;
+}
+
+void ai_column_defer(const uint64_t table_id, const int64_t column_id,
+                     const int64_t now)
+{
+  const uint64_t key = ai_defer_key(table_id, column_id);
+  for (int64_t i = 0; i < g_ai_defer_count; ++i) {
+    if (g_ai_defer_keys[i] == key) {
+      g_ai_defer_until[i] = now + 1000 * 1000; // 1s
+      return;
+    }
+  }
+  if (g_ai_defer_count < AI_DEFER_SLOTS) {
+    g_ai_defer_keys[g_ai_defer_count] = key;
+    g_ai_defer_until[g_ai_defer_count] = now + 1000 * 1000;
+    ++g_ai_defer_count;
+  }
 }
 
 bool is_space(const char c)
@@ -265,8 +308,7 @@ int publish_group(const ObIArray<AIColumnMeta> &metas,
 
 int mark_failure(const AIColumnMeta &meta,
                  const ObString &pk_predicate,
-                 const int64_t retry_count)
-{
+                 const int64_t retry_count){
   int ret = OB_SUCCESS;
   ObSqlString sql;
   ObSqlString state_name;
@@ -293,6 +335,17 @@ int mark_failure(const AIColumnMeta &meta,
   return ret;
 }
 
+void handle_failure(const AIColumnMeta &meta,
+                    const ObString &pk_predicate,
+                    const int64_t retry_count)
+{
+  mark_failure(meta, pk_predicate, retry_count);
+  if (retry_count + 1 <= meta.max_retries_) {
+    ai_column_defer(meta.table_id_, meta.column_id_,
+                    ObTimeUtility::current_time());
+  }
+}
+
 int build_pk_predicate(const ObIArray<ObString> &pk_columns, ObSqlString &sql)
 {
   int ret = OB_SUCCESS;
@@ -315,6 +368,7 @@ int process_table(const ObString &database_name,
                   const ObIArray<AIColumnMeta> &metas)
 {
   int ret = OB_SUCCESS;
+  const int64_t now = ObTimeUtility::current_time();
   ObSqlString sql;
   ObSqlString pk_pred_sql;
   ObArenaAllocator arena(ObModIds::OB_SQL_EXECUTOR);
@@ -341,7 +395,6 @@ int process_table(const ObString &database_name,
   }
   OZ(sql.append(" limit 20"));
 
-  bool had_retry = false;
   HEAP_VAR(ObMySQLProxy::ReadResult, res) {
     common::sqlclient::ObMySQLResult *result = NULL;
     if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
@@ -374,7 +427,9 @@ int process_table(const ObString &database_name,
           } else if (OB_FAIL(result->get_int(
                          static_cast<int64_t>(2 + 2 * i), retry_count))) {
           }
-          if (OB_SUCC(ret) && (state_is_null || 0 == state || 3 == state)) {
+          if (OB_SUCC(ret) && (state_is_null || 0 == state || 3 == state)
+              && !ai_column_deferred(metas.at(i).table_id_,
+                                     metas.at(i).column_id_, now)) {
             OZ(pending_metas.push_back(metas.at(i)));
             OZ(pending_retries.push_back(retry_count));
           }
@@ -397,8 +452,7 @@ int process_table(const ObString &database_name,
           if (OB_FAIL(parse_ai_expression(arena, meta.expression_, is_embed,
                                           model, prompt_expr, hint))) {
             ret = OB_SUCCESS;
-            had_retry = true;
-            mark_failure(meta, pk_predicate, pending_retries.at(i));
+            handle_failure(meta, pk_predicate, pending_retries.at(i));
             continue;
           }
           ObSqlString call_sql;
@@ -443,12 +497,10 @@ int process_table(const ObString &database_name,
             } else {
               LOG_WARN("ai column model call failed", K(ret), K(meta.column_name_));
               ret = OB_SUCCESS;
-              had_retry = true;
-              mark_failure(meta, pk_predicate, pending_retries.at(i));
+              handle_failure(meta, pk_predicate, pending_retries.at(i));
             }
           } else if (null_value || value.empty()) {
-            had_retry = true;
-            mark_failure(meta, pk_predicate, pending_retries.at(i));
+            handle_failure(meta, pk_predicate, pending_retries.at(i));
           } else {
             OZ(ok_metas.push_back(meta));
             OZ(ok_results.push_back(value));
@@ -460,16 +512,12 @@ int process_table(const ObString &database_name,
           if (OB_FAIL(publish_group(ok_metas, ok_results, ok_hashes,
                                     ok_prompts, pk_predicate))) {
             LOG_WARN("failed to publish ai column results", K(ret));
-            had_retry = true;
             for (int64_t i = 0; i < ok_metas.count(); ++i) {
-              mark_failure(ok_metas.at(i), pk_predicate, 0);
+              handle_failure(ok_metas.at(i), pk_predicate, 0);
             }
             ret = OB_SUCCESS;
           }
         }
-      }
-      if (had_retry) {
-        usleep(800 * 1000);
       }
 
       if (OB_ITER_END == ret) {
@@ -491,7 +539,7 @@ int ObAIColumnWorker::process_once()
     ObSEArray<AIColumnMeta, 16> metas;
     ObSqlString sql;
     OZ(sql.append(
-        "select a.table_id, a.column_name, a.max_retries, a.normalized_expr, "
+        "select a.table_id, a.column_id, a.column_name, a.max_retries, a.normalized_expr, "
         "t.table_name, d.database_name "
         "from oceanbase.__all_ai_column a "
         "join oceanbase.__all_table t on t.table_id = a.table_id "
@@ -505,6 +553,7 @@ int ObAIColumnWorker::process_once()
       } else {
         while (OB_SUCC(ret) && OB_SUCC(result->next())) {
           int64_t table_id = 0;
+          int64_t column_id = 0;
           int64_t max_retries = 0;
           ObString column_name;
           ObString expression;
@@ -512,6 +561,7 @@ int ObAIColumnWorker::process_once()
           ObString database_name;
           AIColumnMeta meta;
           if (OB_FAIL(result->get_int("table_id", table_id))) {
+          } else if (OB_FAIL(result->get_int("column_id", column_id))) {
           } else if (OB_FAIL(result->get_varchar("column_name", column_name))) {
           } else if (OB_FAIL(result->get_int("max_retries", max_retries))) {
           } else if (OB_FAIL(result->get_varchar("normalized_expr", expression))) {
@@ -519,6 +569,7 @@ int ObAIColumnWorker::process_once()
           } else if (OB_FAIL(result->get_varchar("database_name", database_name))) {
           } else {
             meta.table_id_ = static_cast<uint64_t>(table_id);
+            meta.column_id_ = column_id;
             meta.max_retries_ = max_retries;
             if (OB_FAIL(copy_string(arena, column_name, meta.column_name_))
                 || OB_FAIL(copy_string(arena, expression, meta.expression_))

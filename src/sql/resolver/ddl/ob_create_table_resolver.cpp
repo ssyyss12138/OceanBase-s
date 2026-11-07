@@ -333,8 +333,9 @@ int ObCreateTableResolver::resolve_ai_column_definition(
   for (int64_t i = 0; OB_SUCC(ret) && i < create_stmt->get_ai_column_defs().count(); ++i) {
     if (ai_column_contains_identifier(expr,
           create_stmt->get_ai_column_defs().at(i).column_name_)) {
+      // Dependencies between AI columns are not supported.  Keep the generic
+      // OB_NOT_SUPPORTED message ("Not supported feature or function").
       ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column");
     }
   }
 

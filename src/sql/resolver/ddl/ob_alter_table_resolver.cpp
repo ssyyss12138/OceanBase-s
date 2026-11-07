@@ -3592,7 +3592,6 @@ int ObAlterTableResolver::resolve_ai_column_for_alter(const ParseNode &node,
       ret = OB_ERR_COLUMN_DUPLICATE;
     } else if (ai_column_expr_contains(trimmed_expr, added.column_name_)) {
       ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column");
     }
   }
   for (ObTableSchema::const_column_iterator iter = table_schema_->column_begin();
@@ -3621,7 +3620,6 @@ int ObAlterTableResolver::resolve_ai_column_for_alter(const ParseNode &node,
         const ObString ai_name(hidden_name.length() - prefix_len, hidden_name.ptr() + prefix_len);
         if (ai_column_expr_contains(trimmed_expr, ai_name)) {
           ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column");
         }
       }
     }
