@@ -232,9 +232,35 @@ int rebuild_ai_column_task_view()
     }
     ObSqlString ddl;
     int64_t affected_rows = 0;
-    OZ(ddl.append_fmt("drop view if exists %s", AI_COLUMN_TASK_TNAME));
-    if (OB_FAIL(GCTX.sql_proxy_->write(ddl.ptr(), affected_rows))) {
-      LOG_WARN("failed to drop ai column task view", K(ret));
+    bool view_exists = false;
+    {
+      ObSqlString exist_sql;
+      OZ(exist_sql.append(
+          "select count(*) as c from oceanbase.__all_table t "
+          "join oceanbase.__all_database d on d.database_id = t.database_id "
+          "where d.database_name = 'oceanbase' "
+          "and t.table_name = '__all_ai_column_task'"));
+      HEAP_VAR(ObMySQLProxy::ReadResult, exist_res) {
+        common::sqlclient::ObMySQLResult *exist_result = NULL;
+        int64_t exist_count = 0;
+        if (OB_FAIL(GCTX.sql_proxy_->read(exist_res, exist_sql.ptr()))) {
+          LOG_WARN("failed to check ai column task view", K(ret));
+        } else if (OB_ISNULL(exist_result = exist_res.get_result())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(exist_result->next())) {
+        } else if (OB_FAIL(exist_result->get_int(static_cast<int64_t>(0),
+                                                 exist_count))) {
+        } else {
+          view_exists = exist_count > 0;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && view_exists) {
+      OZ(ddl.append_fmt("drop view if exists %s", AI_COLUMN_TASK_TNAME));
+      if (OB_FAIL(GCTX.sql_proxy_->write(ddl.ptr(), affected_rows))) {
+        LOG_WARN("failed to drop ai column task view", K(ret));
+      }
+      ddl.reset();
     }
     ddl.reset();
     OZ(ddl.append_fmt("create view %s as %s", AI_COLUMN_TASK_TNAME, body.ptr()));
@@ -247,11 +273,19 @@ int rebuild_ai_column_task_view()
 }
 
 int persist_ai_column_metadata(const common::ObIArray<ObAIColumnDef> &defs,
-                               const uint64_t table_id)
+                               const uint64_t table_id,
+                               const bool reset_table)
 {
   int ret = OB_SUCCESS;
   OZ(ensure_ai_column_tables());
   OZ(cleanup_orphan_ai_column_metadata());
+  if (OB_SUCC(ret) && reset_table) {
+    ObSqlString del_sql;
+    int64_t affected_rows = 0;
+    OZ(del_sql.append_fmt("delete from %s where table_id = %lu",
+                          AI_COLUMN_META_TNAME, table_id));
+    OZ(GCTX.sql_proxy_->write(del_sql.ptr(), affected_rows));
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < defs.count(); ++i) {
     const ObAIColumnDef &def = defs.at(i);
     ObDMLSqlSplicer dml;
@@ -284,7 +318,18 @@ int persist_ai_column_metadata(const common::ObIArray<ObAIColumnDef> &defs,
       ret = OB_ERR_UNEXPECTED;
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(rebuild_ai_column_task_view())) {
+  if (OB_SUCC(ret)) {
+    for (int64_t attempt = 0; OB_SUCC(ret) && attempt < 20; ++attempt) {
+      if (OB_FAIL(rebuild_ai_column_task_view())) {
+        if (attempt + 1 < 20) {
+          ret = OB_SUCCESS;
+          ObMultiVersionSchemaService::get_instance().refresh_and_add_schema();
+          usleep(50 * 1000);
+        }
+      } else {
+        break;
+      }
+    }
   }
   return ret;
 }
@@ -294,14 +339,34 @@ int fill_ai_column_ids_from_schema(const common::ObIArray<ObAIColumnDef> &defs,
                                    common::ObIArray<ObAIColumnDef> &filled)
 {
   int ret = OB_SUCCESS;
-  share::schema::ObSchemaGetterGuard guard;
-  const ObTableSchema *table_schema = NULL;
-  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard))) {
-    LOG_WARN("failed to get schema guard", K(ret));
-  } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
-    LOG_WARN("failed to get table schema", K(ret), K(table_id));
-  } else if (OB_ISNULL(table_schema)) {
-    ret = OB_TABLE_NOT_EXIST;
+  ObArenaAllocator arena(ObModIds::OB_SQL_EXECUTOR);
+  ObSqlString sql;
+  ObSEArray<ObString, 32> column_names;
+  ObSEArray<uint64_t, 32> column_ids;
+  OZ(sql.append_fmt("select column_name, column_id from oceanbase.__all_column "
+                    "where table_id = %lu", table_id));
+  HEAP_VAR(ObMySQLProxy::ReadResult, res) {
+    common::sqlclient::ObMySQLResult *result = NULL;
+    if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+      LOG_WARN("failed to read column schema", K(ret), K(table_id));
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+        ObString name;
+        int64_t id = 0;
+        ObString copied;
+        if (OB_FAIL(result->get_varchar("column_name", name))) {
+        } else if (OB_FAIL(result->get_int("column_id", id))) {
+        } else if (OB_FAIL(ob_write_string(arena, name, copied))) {
+        } else if (OB_FAIL(column_names.push_back(copied))) {
+        } else if (OB_FAIL(column_ids.push_back(static_cast<uint64_t>(id)))) {
+        }
+      }
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      }
+    }
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < defs.count(); ++i) {
     ObAIColumnDef def = defs.at(i);
@@ -314,27 +379,28 @@ int fill_ai_column_ids_from_schema(const common::ObIArray<ObAIColumnDef> &defs,
         def.column_name_.length(), def.column_name_.ptr()));
     OZ(spec_name.append_fmt("__ai_spec_%.*s",
         def.column_name_.length(), def.column_name_.ptr()));
-    const ObColumnSchemaV2 *result_col = NULL;
-    const ObColumnSchemaV2 *state_col = NULL;
-    const ObColumnSchemaV2 *request_col = NULL;
-    const ObColumnSchemaV2 *spec_col = NULL;
-    if (OB_SUCC(ret)) {
-      result_col = table_schema->get_column_schema(def.column_name_);
-      state_col = table_schema->get_column_schema(state_name.string());
-      request_col = table_schema->get_column_schema(request_name.string());
-      spec_col = table_schema->get_column_schema(spec_name.string());
-      if (OB_ISNULL(result_col) || OB_ISNULL(state_col)
-          || OB_ISNULL(request_col) || OB_ISNULL(spec_col)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("ai column hidden schema not found", K(ret), K(def),
-                 KP(result_col), KP(state_col), KP(request_col), KP(spec_col));
-      } else {
-        def.column_id_ = result_col->get_column_id();
-        def.state_column_id_ = state_col->get_column_id();
-        def.request_column_id_ = request_col->get_column_id();
-        def.result_spec_column_id_ = spec_col->get_column_id();
-        OZ(filled.push_back(def));
+    const ObString wanted[4] = {def.column_name_, state_name.string(),
+                                request_name.string(), spec_name.string()};
+    uint64_t ids[4] = {OB_INVALID_ID, OB_INVALID_ID, OB_INVALID_ID, OB_INVALID_ID};
+    for (int64_t w = 0; OB_SUCC(ret) && w < 4; ++w) {
+      for (int64_t c = 0; c < column_names.count(); ++c) {
+        if (0 == column_names.at(c).case_compare(wanted[w])) {
+          ids[w] = column_ids.at(c);
+          break;
+        }
       }
+    }
+    if (OB_SUCC(ret)
+        && (OB_INVALID_ID == ids[0] || OB_INVALID_ID == ids[1]
+            || OB_INVALID_ID == ids[2] || OB_INVALID_ID == ids[3])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ai column hidden columns not found", K(ret), K(def), K(table_id));
+    } else {
+      def.column_id_ = ids[0];
+      def.state_column_id_ = ids[1];
+      def.request_column_id_ = ids[2];
+      def.result_spec_column_id_ = ids[3];
+      OZ(filled.push_back(def));
     }
   }
   return ret;
@@ -348,7 +414,7 @@ int persist_alter_ai_column_metadata(const ObAlterTableStmt &stmt,
   if (OB_FAIL(fill_ai_column_ids_from_schema(stmt.get_ai_column_defs(),
                                              table_id, defs))) {
     LOG_WARN("failed to resolve ai column ids", K(ret), K(table_id));
-  } else if (OB_FAIL(persist_ai_column_metadata(defs, table_id))) {
+  } else if (OB_FAIL(persist_ai_column_metadata(defs, table_id, false))) {
     LOG_WARN("failed to persist ai column metadata", K(ret), K(table_id));
   }
   return ret;
@@ -798,7 +864,7 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
       }
     }
     if (OB_SUCC(ret) && !stmt.get_ai_column_defs().empty()) {
-      OZ(persist_ai_column_metadata(stmt.get_ai_column_defs(), res.table_id_));
+      OZ(persist_ai_column_metadata(stmt.get_ai_column_defs(), res.table_id_, true));
     }
     SERVER_EVENT_ADD("ddl", "create table execute finish",
       "ret", ret,
