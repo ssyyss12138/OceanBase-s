@@ -75,6 +75,11 @@ private:
   int64_t get_primary_key_size() const;
   int add_primary_key_part(const common::ObString &column_name, common::ObArray<ObColumnResolveStat> &stats, int64_t &pk_data_length);
   int add_hidden_tablet_seq_col();
+  int resolve_ai_column_definition(
+      const ParseNode &node,
+      const share::schema::ObColumnSchemaV2 &result_column,
+      common::ObIArray<share::schema::ObColumnSchemaV2> &resolved_cols,
+      share::schema::ObTableSchema &table_schema);
   int check_column_name_duplicate(const ParseNode *node);
   int resolve_primary_key_node(const ParseNode &pk_node, common::ObArray<ObColumnResolveStat> &stats);
   int resolve_table_elements(const ParseNode *node,

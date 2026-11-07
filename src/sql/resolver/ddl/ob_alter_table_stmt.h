@@ -20,6 +20,7 @@
 
 #include "sql/resolver/ddl/ob_table_stmt.h"
 #include "sql/resolver/ddl/ob_ddl_stmt.h"
+#include "sql/resolver/ddl/ob_ai_column_def.h"
 #include "sql/resolver/ob_stmt_resolver.h"
 #include "common/sql_mode/ob_sql_mode.h"
 #include "lib/hash/ob_placement_hashset.h"
@@ -104,6 +105,9 @@ public:
     alter_table_arg_.lock_session_create_ts_ = create_ts;
   }
   void set_lock_priority();
+  common::ObIArray<ObAIColumnDef> &get_ai_column_defs() { return ai_column_defs_; }
+  const common::ObIArray<ObAIColumnDef> &get_ai_column_defs() const { return ai_column_defs_; }
+  int add_ai_column_def(const ObAIColumnDef &def) { return ai_column_defs_.push_back(def); }
 private:
   obcall::ObAlterTableArg alter_table_arg_;
   bool is_comment_table_;
@@ -114,6 +118,7 @@ private:
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
+  common::ObSEArray<ObAIColumnDef, 4> ai_column_defs_;
 };
 
 inline int ObAlterTableStmt::set_tz_info_wrap(const common::ObTimeZoneInfoWrap &tz_info_wrap)

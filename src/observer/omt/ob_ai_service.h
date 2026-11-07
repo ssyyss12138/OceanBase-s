@@ -23,12 +23,23 @@
 #include "lib/container/ob_se_array.h"
 #include "sql/privilege_check/ob_ai_model_priv_util.h"
 #include "share/ob_server_struct.h"
+#include "share/ob_thread_pool.h"
 #include "lib/worker.h"
 
 namespace oceanbase
 {
 namespace omt
 {
+
+// Background worker that evaluates pending AI columns and publishes results.
+class ObAIColumnWorker : public share::ObThreadPool
+{
+public:
+  ObAIColumnWorker() {}
+  virtual ~ObAIColumnWorker() {}
+  virtual void run1() override;
+  int process_once();
+};
 
 class ObAiServiceGuard
 {
@@ -50,14 +61,15 @@ public:
   virtual ~ObAiService();
   static int server_module_init(ObAiService* &ai_service);
   int init();
-  int start() { return OB_SUCCESS; }
-  void stop() {};
-  void wait() {};
+  int start();
+  void stop();
+  void wait();
   void destroy();
 public:
   int get_ai_service_guard(ObAiServiceGuard &ai_service_guard);
 private:
   bool is_inited_;
+  ObAIColumnWorker ai_column_worker_;
   DISALLOW_COPY_AND_ASSIGN(ObAiService);
 };
 

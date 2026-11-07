@@ -196,6 +196,7 @@ protected:
   int build_hidden_pk_assignment(ObTableAssignment &ta,
                                  const TableItem *table_item,
                                  const ObTableSchema *table_schema);
+  int build_ai_column_invalidation(common::ObIArray<ObTableAssignment> &table_assigns);
   // replace generate column's dependent column with new inserted value (the column convert func).
   int replace_gen_col_dependent_col(ObInsertTableInfo& table_info);
   int replace_col_with_new_value(ObInsertTableInfo& table_info, ObRawExpr *&expr);

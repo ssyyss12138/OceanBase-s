@@ -20,6 +20,7 @@
 #include "sql/resolver/ddl/ob_table_stmt.h"
 #include "sql/resolver/ob_stmt_resolver.h"
 #include "sql/resolver/ddl/ob_create_index_stmt.h"
+#include "sql/resolver/ddl/ob_ai_column_def.h"
 
 namespace oceanbase
 {
@@ -74,6 +75,9 @@ public:
   void set_masked_sql(const common::ObString &masked_sql) { masked_sql_ = masked_sql; }
   common::ObString get_masked_sql() const { return masked_sql_; }
   void set_insert_mode(uint64_t mode) { insert_mode_ = mode; }
+  common::ObIArray<ObAIColumnDef> &get_ai_column_defs() { return ai_column_defs_; }
+  const common::ObIArray<ObAIColumnDef> &get_ai_column_defs() const { return ai_column_defs_; }
+  int add_ai_column_def(const ObAIColumnDef &def) { return ai_column_defs_.push_back(def); }
   uint64_t get_insert_mode() const { return insert_mode_; }
 
   ObTableType get_table_type() const { return create_table_arg_.schema_.get_table_type(); }
@@ -108,6 +112,7 @@ protected:
    3. rename ctas_t1 as t1
    */
   uint64_t insert_mode_;
+  common::ObSEArray<ObAIColumnDef, 4> ai_column_defs_;
 };
 
 inline obcall::ObCreateTableArg &ObCreateTableStmt::get_create_table_arg()
