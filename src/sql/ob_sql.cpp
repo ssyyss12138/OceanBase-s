@@ -40,6 +40,10 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "share/schema/ob_schema_struct.h"
+#include "sql/resolver/dml/ob_dml_stmt.h"
+#include "sql/resolver/expr/ob_raw_expr.h"
 
 namespace oceanbase
 {
@@ -1958,6 +1962,11 @@ int ObSql::handle_ps_execute(const ObPsStmtId client_stmt_id,
   return ret;
 }
 
+static int ai_retry_rewrite(ObSQLSessionInfo &session,
+                            const ObString &stmt,
+                            ObString &rewritten,
+                            bool &hit);
+
 OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -1975,6 +1984,16 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
 
   ObIAllocator &allocator = THIS_WORKER.get_sql_arena_allocator();
   ObSQLSessionInfo &session = result.get_session();
+  if (OB_SUCC(ret) && !trimed_stmt.empty()) {
+    ObString rewritten;
+    bool is_ai_retry = false;
+    if (OB_FAIL(ai_retry_rewrite(session, trimed_stmt, rewritten, is_ai_retry))) {
+      result.get_exec_context().set_need_disconnect(false);
+      LOG_WARN("failed to rewrite ai column retry", K(ret));
+    } else if (is_ai_retry) {
+      trimed_stmt = rewritten;
+    }
+  }
   
   ObExecContext& ectx = result.get_exec_context();
   int get_plan_err = OB_SUCCESS; //used for judge whether add plan to plan cache
@@ -2062,6 +2081,455 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   }
   if (NULL != pc_ctx) {
     pc_ctx->~ObPlanCacheCtx();
+  }
+  return ret;
+}
+
+static int check_ai_column_strict_read_recursive(ObSQLSessionInfo &session,
+                                                 ObSchemaGetterGuard &guard,
+                                                 ObDMLStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(stmt)) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_size(); ++i) {
+      const ColumnItem *item = stmt->get_column_item(i);
+      const TableItem *table = NULL;
+      const ObTableSchema *table_schema = NULL;
+      const ObDatabaseSchema *db_schema = NULL;
+      if (OB_ISNULL(item)) {
+        continue;
+      } else if (OB_ISNULL(table = stmt->get_table_item_by_id(item->table_id_))
+                 || !table->is_basic_table()) {
+        continue;
+      } else if (OB_FAIL(guard.get_table_schema(table->ref_id_, table_schema))) {
+        break;
+      } else if (OB_ISNULL(table_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        break;
+      }
+      const ObColumnSchemaV2 *column_schema =
+          table_schema->get_column_schema(item->column_id_);
+      ObSqlString state_name;
+      const ObColumnSchemaV2 *state_column = NULL;
+      if (OB_ISNULL(column_schema)) {
+        continue;
+      } else if (OB_FAIL(state_name.append_fmt("__ai_state_%.*s",
+                     column_schema->get_column_name_str().length(),
+                     column_schema->get_column_name_str().ptr()))) {
+        break;
+      } else if (OB_ISNULL(state_column =
+                     table_schema->get_column_schema(state_name.string()))
+                 || !state_column->is_hidden()) {
+        continue;
+      }
+      if (OB_FAIL(guard.get_database_schema(table_schema->get_database_id(),
+                                            db_schema))
+          || OB_ISNULL(db_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        break;
+      }
+      ObSqlString sql;
+      if (OB_FAIL(sql.append_fmt(
+              "select count(*) as c from `%.*s`.`%.*s` "
+              "where `%.*s` is null or `%.*s` <> 2",
+              db_schema->get_database_name_str().length(),
+              db_schema->get_database_name_str().ptr(),
+              table_schema->get_table_name_str().length(),
+              table_schema->get_table_name_str().ptr(),
+              state_name.length(), state_name.ptr(),
+              state_name.length(), state_name.ptr()))) {
+        break;
+      }
+      int64_t unfinished = 0;
+      HEAP_VAR(ObMySQLProxy::ReadResult, res) {
+        common::sqlclient::ObMySQLResult *result = NULL;
+        if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+        } else if (OB_ISNULL(result = res.get_result())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(result->next())) {
+        } else if (OB_FAIL(result->get_int(static_cast<int64_t>(0),
+                                           unfinished))) {
+        }
+      }
+      if (OB_SUCC(ret) && unfinished > 0) {
+        ret = OB_ERR_AI_COLUMN_NOT_READY;
+        LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY,
+                       table_schema->get_table_id(), item->column_id_);
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_subquery_expr_size(); ++i) {
+      ObQueryRefRawExpr *query_ref = stmt->get_subquery_exprs().at(i);
+      if (OB_ISNULL(query_ref) || OB_ISNULL(query_ref->get_ref_stmt())) {
+        continue;
+      } else if (OB_FAIL(check_ai_column_strict_read_recursive(
+                     session, guard,
+                     static_cast<ObDMLStmt *>(query_ref->get_ref_stmt())))) {
+        break;
+      }
+    }
+  }
+  return ret;
+}
+
+static int check_ai_column_strict_read(ObSQLSessionInfo &session,
+                                       ObSchemaGetterGuard &guard,
+                                       ObStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  bool strict = false;
+  ObDMLStmt *dml_stmt = NULL;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session.get_sys_variable(SYS_VAR_AI_COLUMN_STRICT_READ,
+                                              strict))) {
+  } else if (!strict) {
+  } else if (stmt::T_SELECT != stmt->get_stmt_type()
+             && stmt::T_UPDATE != stmt->get_stmt_type()
+             && stmt::T_DELETE != stmt->get_stmt_type()) {
+    // strict read only applies to statements that read AI columns
+  } else if (OB_ISNULL(dml_stmt = static_cast<ObDMLStmt *>(stmt))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ret = check_ai_column_strict_read_recursive(session, guard, dml_stmt);
+  }
+  return ret;
+}
+
+static bool ai_retry_ident_char(const char c)
+{
+  return isalnum(static_cast<unsigned char>(c)) || '_' == c || '$' == c;
+}
+
+static void ai_retry_skip_spaces(const char *&p, const char *end)
+{
+  while (p < end && isspace(static_cast<unsigned char>(*p))) {
+    ++p;
+  }
+}
+
+static bool ai_retry_match_word(const char *&p, const char *end, const char *word)
+{
+  ai_retry_skip_spaces(p, end);
+  const int64_t len = static_cast<int64_t>(strlen(word));
+  if (p + len <= end && 0 == strncasecmp(p, word, len)
+      && (p + len == end || !ai_retry_ident_char(p[len]))) {
+    p += len;
+    return true;
+  }
+  return false;
+}
+
+// Read a possibly backtick-quoted identifier (or dotted name) as a raw token.
+static void ai_retry_read_token(const char *&p, const char *end, ObString &token)
+{
+  ai_retry_skip_spaces(p, end);
+  const char *start = p;
+  while (p < end) {
+    const char c = *p;
+    if ('`' == c) {
+      ++p;
+      while (p < end) {
+        if ('`' == *p) {
+          if (p + 1 < end && '`' == p[1]) {
+            p += 2;
+          } else {
+            ++p;
+            break;
+          }
+        } else {
+          ++p;
+        }
+      }
+    } else if (isspace(static_cast<unsigned char>(c))) {
+      break;
+    } else {
+      ++p;
+    }
+  }
+  token.assign_ptr(start, static_cast<int32_t>(p - start));
+}
+
+static void ai_retry_unquote(const ObString &src, ObString &dst)
+{
+  char *buf = static_cast<char *>(ob_malloc(src.length() + 1, ObMemAttr("AiRetry")));
+  if (NULL == buf) {
+    dst.reset();
+  } else {
+    int32_t len = 0;
+    for (int32_t i = 0; i < src.length(); ++i) {
+      if ('`' != src.ptr()[i]) {
+        buf[len++] = src.ptr()[i];
+      }
+    }
+    dst.assign_ptr(buf, len);
+  }
+}
+
+static int ai_retry_split_table(const ObString &table, ObString &db, ObString &name)
+{
+  int ret = OB_SUCCESS;
+  ObString trimmed = table.trim();
+  if (trimmed.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if ('`' == trimmed.ptr()[0]) {
+    int32_t i = 1;
+    while (i < trimmed.length() && '`' != trimmed.ptr()[i]) {
+      ++i;
+    }
+    ObString first(static_cast<int32_t>(i - 1), trimmed.ptr() + 1);
+    if (i + 1 < trimmed.length() && '.' == trimmed.ptr()[i + 1]) {
+      db = first;
+      int32_t j = i + 2;
+      if (j < trimmed.length() && '`' == trimmed.ptr()[j]) {
+        int32_t k = j + 1;
+        while (k < trimmed.length() && '`' != trimmed.ptr()[k]) {
+          ++k;
+        }
+        name.assign_ptr(trimmed.ptr() + j + 1, static_cast<int32_t>(k - j - 1));
+      } else {
+        name.assign_ptr(trimmed.ptr() + j, trimmed.length() - j);
+      }
+    } else {
+      name = first;
+    }
+  } else {
+    int32_t dot = -1;
+    for (int32_t i = 0; i < trimmed.length(); ++i) {
+      if ('.' == trimmed.ptr()[i]) {
+        dot = i;
+        break;
+      }
+    }
+    if (dot < 0) {
+      name = trimmed;
+    } else {
+      db.assign_ptr(trimmed.ptr(), dot);
+      name.assign_ptr(trimmed.ptr() + dot + 1, trimmed.length() - dot - 1);
+    }
+  }
+  return ret;
+}
+
+static int ai_retry_append_quoted(ObSqlString &sql, const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  OZ(sql.append("'"));
+  for (int32_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+    const char c = value.ptr()[i];
+    if ('\'' == c || '\\' == c) {
+      OZ(sql.append("\\"));
+    }
+    OZ(sql.append_fmt("%c", c));
+  }
+  OZ(sql.append("'"));
+  return ret;
+}
+
+static int ai_retry_is_ai_column(ObSQLSessionInfo &session,
+                                 const ObString &table_token,
+                                 const ObString &column_token,
+                                 bool &is_ai)
+{
+  int ret = OB_SUCCESS;
+  is_ai = false;
+  ObString table;
+  ObString column;
+  ai_retry_unquote(table_token, table);
+  ai_retry_unquote(column_token, column);
+  ObString db;
+  ObString name;
+  OZ(ai_retry_split_table(table, db, name));
+  if (OB_SUCC(ret) && db.empty()) {
+    db = session.get_database_name();
+  }
+  if (OB_SUCC(ret) && (!table.empty() && !column.empty() && !db.empty())) {
+    ObSqlString sql;
+    OZ(sql.append("select count(*) as c from oceanbase.__all_ai_column a "
+                  "join oceanbase.__all_table t on t.table_id = a.table_id "
+                  "join oceanbase.__all_database d on d.database_id = t.database_id "
+                  "where d.database_name = "));
+    OZ(ai_retry_append_quoted(sql, db));
+    OZ(sql.append(" and t.table_name = "));
+    OZ(ai_retry_append_quoted(sql, name));
+    OZ(sql.append(" and a.column_name = "));
+    OZ(ai_retry_append_quoted(sql, column));
+    int64_t cnt = 0;
+    HEAP_VAR(ObMySQLProxy::ReadResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(result->next())) {
+      } else if (OB_FAIL(result->get_int(static_cast<int64_t>(0), cnt))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      is_ai = cnt > 0;
+    }
+  }
+  if (NULL != table.ptr()) {
+    ob_free(const_cast<char *>(table.ptr()));
+  }
+  if (NULL != column.ptr()) {
+    ob_free(const_cast<char *>(column.ptr()));
+  }
+  if (NULL != db.ptr() && db.ptr() != table.ptr()) {
+    // db/name may point into the freed buffers; nothing to free separately
+  }
+  return ret;
+}
+
+// Map the retry-only pseudo column `status` to the hidden state column.
+static int ai_retry_map_status(ObSqlString &sql,
+                               const ObString &predicate,
+                               const ObString &column)
+{
+  int ret = OB_SUCCESS;
+  char quote = 0;
+  for (int32_t i = 0; OB_SUCC(ret) && i < predicate.length(); ++i) {
+    const char c = predicate.ptr()[i];
+    if (0 != quote) {
+      OZ(sql.append_fmt("%c", c));
+      if (c == quote && (i == 0 || '\\' != predicate.ptr()[i - 1])) {
+        quote = 0;
+      }
+    } else if ('\'' == c || '"' == c || '`' == c) {
+      quote = c;
+      OZ(sql.append_fmt("%c", c));
+    } else if ((c == 's' || c == 'S')
+               && i + 6 <= predicate.length()
+               && 0 == strncasecmp(predicate.ptr() + i, "status", 6)
+               && (i == 0 || !ai_retry_ident_char(predicate.ptr()[i - 1]))
+               && (i + 6 == predicate.length()
+                   || !ai_retry_ident_char(predicate.ptr()[i + 6]))) {
+      OZ(sql.append_fmt("(case `__ai_state_%.*s` when 2 then 'READY' "
+                        "when 3 then 'PENDING' when 4 then 'FAILED' "
+                        "else 'PENDING' end)",
+                        column.length(), column.ptr()));
+      i += 5;
+    } else {
+      OZ(sql.append_fmt("%c", c));
+    }
+  }
+  return ret;
+}
+
+static bool ai_retry_has_top_level_comma(const ObString &predicate)
+{
+  int64_t depth = 0;
+  char quote = 0;
+  for (int32_t i = 0; i < predicate.length(); ++i) {
+    const char c = predicate.ptr()[i];
+    if (0 != quote) {
+      if (c == quote && (i == 0 || '\\' != predicate.ptr()[i - 1])) {
+        quote = 0;
+      }
+    } else if ('\'' == c || '"' == c || '`' == c) {
+      quote = c;
+    } else if ('(' == c) {
+      ++depth;
+    } else if (')' == c) {
+      --depth;
+    } else if (',' == c && 0 == depth) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Rewrite "ALTER TABLE t RETRY AI COLUMN c [WHERE ...]" into an UPDATE on the
+// hidden state columns.  Returns hit=false when the statement is not a RETRY.
+static int ai_retry_rewrite(ObSQLSessionInfo &session,
+                            const ObString &stmt,
+                            ObString &rewritten,
+                            bool &hit)
+{
+  int ret = OB_SUCCESS;
+  hit = false;
+  const char *p = stmt.ptr();
+  const char *end = stmt.ptr() + stmt.length();
+  ObString table_token;
+  ObString column_token;
+  if (!ai_retry_match_word(p, end, "alter")) {
+    // not an ALTER statement
+  } else if (!ai_retry_match_word(p, end, "table")) {
+  } else {
+    ai_retry_read_token(p, end, table_token);
+    if (!ai_retry_match_word(p, end, "retry")) {
+      // other ALTER action
+    } else if (!ai_retry_match_word(p, end, "ai")
+               || !ai_retry_match_word(p, end, "column")) {
+      int tmp_ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+      ret = tmp_ret;
+    } else {
+      ai_retry_read_token(p, end, column_token);
+      ai_retry_skip_spaces(p, end);
+      ObString predicate;
+      if (p < end && ',' == *p) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "combining AI COLUMN RETRY with another ALTER action");
+      } else if (p == end) {
+        hit = true;
+      } else if (!ai_retry_match_word(p, end, "where")) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "combining AI COLUMN RETRY with another ALTER action");
+      } else {
+        predicate.assign_ptr(p, static_cast<int32_t>(end - p));
+        hit = true;
+      }
+      if (OB_SUCC(ret) && hit && ai_retry_has_top_level_comma(predicate)) {
+        ret = OB_NOT_SUPPORTED;
+        hit = false;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "combining AI COLUMN RETRY with another ALTER action");
+      }
+      if (OB_SUCC(ret) && hit) {
+        ObString table;
+        ObString column;
+        ai_retry_unquote(table_token, table);
+        ai_retry_unquote(column_token, column);
+        bool is_ai = false;
+        if (OB_FAIL(ai_retry_is_ai_column(session, table_token, column_token, is_ai))) {
+        } else if (!is_ai) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "retrying a column that is not an AI column");
+        } else {
+          ObSqlString sql;
+          OZ(sql.append_fmt("update %.*s set `%.*s` = null, "
+                            "`__ai_state_%.*s` = 0, `__ai_request_%.*s` = null",
+                            table_token.length(), table_token.ptr(),
+                            column.length(), column.ptr(),
+                            column.length(), column.ptr(),
+                            column.length(), column.ptr()));
+          if (OB_SUCC(ret) && !predicate.empty()) {
+            OZ(sql.append(" where "));
+            OZ(ai_retry_map_status(sql, predicate, column));
+          }
+          if (OB_SUCC(ret)) {
+            char *buf = static_cast<char *>(ob_malloc(sql.length() + 1,
+                                                      ObMemAttr("AiRetrySql")));
+            if (OB_ISNULL(buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              MEMCPY(buf, sql.ptr(), sql.length());
+              buf[sql.length()] = '\0';
+              rewritten.assign_ptr(buf, static_cast<int32_t>(sql.length()));
+            }
+          }
+        }
+        if (NULL != table.ptr()) {
+          ob_free(const_cast<char *>(table.ptr()));
+        }
+        if (NULL != column.ptr()) {
+          ob_free(const_cast<char *>(column.ptr()));
+        }
+      }
+    }
   }
   return ret;
 }
@@ -2200,6 +2668,13 @@ int ObSql::generate_stmt(ParseResult &parse_result,
       context.need_match_all_params_ = resolver_ctx.query_ctx_->need_match_all_params_;
       context.all_local_session_vars_ = &(resolver_ctx.query_ctx_->all_local_session_vars_);
       context.cur_stmt_ = stmt;
+      if (OB_SUCC(ret) && NULL != stmt && NULL != context.schema_guard_) {
+        if (OB_FAIL(check_ai_column_strict_read(result.get_session(),
+                                                *context.schema_guard_,
+                                                stmt))) {
+          SQL_LOG(WARN, "ai column strict read rejected statement", K(ret));
+        }
+      }
       NG_TRACE(resolve_end);
       if (OB_SUCC(ret)) {
         if (NULL != pc_ctx && NULL != pc_ctx->exec_ctx_.get_physical_plan_ctx()) {
